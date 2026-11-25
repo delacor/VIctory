@@ -13237,7 +13237,7 @@ impl<'a> Lower<'a> {
         };
         let mut indices = Vec::new();
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let mut i = self.s.m.bin(c, Bin::And, i, mask);
             // The declared vertex bound is local to this mesh group. The
