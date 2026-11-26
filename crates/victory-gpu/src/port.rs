@@ -190,6 +190,18 @@ fn on_wine() -> bool {
     })
 }
 
+/// Whether the requested in-place constants path can use the renderer's
+/// host device. The memory mapper asks this before it rearranges pages, so a
+/// rejected Wine import uses the stock mappings as well as the stock copies.
+/// Call without holding the title's mapping locks.
+pub fn constants_available() -> bool {
+    on() && (!on_wine() || crate::host::host().is_some_and(|host| can_alias_sections(&host.device)))
+}
+
+fn can_alias_sections(device: &ID3D12Device) -> bool {
+    !on_wine() || crate::inplace::section_views_seen(device)
+}
+
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
@@ -197,7 +209,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // memory of the host's own, not the view's pages: the card would read
     // zeros (#163). Asked once on a section of our own; a copy as before
     // unless the card read the bytes there.
-    if on_wine() && !crate::inplace::section_views_seen(device) {
+    if !can_alias_sections(device) {
         let why = "the host does not show the card a view's pages (a heap of its own memory)";
         return Err((5, why.to_owned()));
     }
@@ -354,7 +366,7 @@ mod tests {
         let _turn = crate::indirect::tests::warp_turn();
         assert!(on_wine(), "this fixture exercises the Wine gate");
         let device = victory_shader::emit::host::create_preferred_device().expect("a D3D12 adapter");
-        assert!(!crate::inplace::section_views_seen(&device));
+        assert!(!can_alias_sections(&device));
         assert!(matches!(open_region(&device, K64, 2 * K64), Err((5, _))));
         println!("section-backed heap rejected before opening title memory");
     }
