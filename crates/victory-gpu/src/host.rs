@@ -2421,9 +2421,26 @@ struct Pool {
     current: usize,
 }
 
-/// A mesh fallback chunk's size; bigger regions get a chunk of their own
-/// (a power of two, kept for later draws).
+/// Small first chunks avoid keeping 16 MiB for a few command words.
+/// Adapted from upstream 9398d08; this fork already recycles every draw.
+const MESH_CHUNK_FIRST: u64 = 1 << 20;
+/// Further chunks double up to this size; a larger region gets the power
+/// of two it needs, so no groups or geometry are cut to fit the pool.
 const MESH_CHUNK: u64 = 16 << 20;
+
+fn small_mesh_chunks() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MESH_SMALL_CHUNKS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_SMALL_CHUNKS").is_none_or(|v| v != "0"))
+}
+
+/// Bytes retained by the mesh pools, including free and delayed chunks.
+pub(crate) fn mesh_scratch_bytes() -> u64 {
+    MESH_CHUNK_BYTES.load(Ordering::Relaxed)
+}
 
 /// Mesh fallback chunks no list holds, in COMMON, by size. A list takes
 /// its chunks from here and gives them back when it is reset, so the
@@ -2492,7 +2509,12 @@ impl Pool {
             at += 1;
         }
         if at == self.chunks.len() {
-            let size = MESH_CHUNK.max(len.next_power_of_two());
+            let chunk = if small_mesh_chunks() {
+                (MESH_CHUNK_FIRST << self.chunks.len().min(16)).min(MESH_CHUNK)
+            } else {
+                MESH_CHUNK
+            };
+            let size = chunk.max(len.next_power_of_two());
             self.chunks.push((make(size)?, size, 0, false));
         }
         self.current = at;
@@ -11691,3 +11713,138 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+// Allocation regressions adapted from upstream VIctory 9398d08. The fork
+// already recycles after each draw; retain that behavior and retirement.
+#[cfg(test)]
+mod mesh_scratch {
+    use super::{MESH_CHUNK, Pool};
+    const MESH_CHUNK_FIRST: u64 = 1 << 20;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// A small buffer standing for a chunk (the pool only keeps it).
+    fn buffer(device: &ID3D12Device) -> ID3D12Resource {
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: a plain buffer creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+        }
+        r.unwrap()
+    }
+
+    #[test]
+    fn draws_get_their_own_regions_and_chunks_come_back_after_a_reset() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        let mut region = |pool: &mut Pool, len| {
+            pool.region(len, |size| {
+                made.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap()
+        };
+        let same = |a: &super::ScratchRegion, b: &super::ScratchRegion| {
+            a.buffer.as_raw() == b.buffer.as_raw()
+        };
+        let a = region(&mut pool, 1000);
+        let b = region(&mut pool, 300);
+        assert_eq!((a.offset, a.first), (0, true));
+        // 256-byte aligned after the first; the chunk is already a UAV.
+        assert_eq!((b.offset, b.first), (1024, false));
+        assert!(same(&a, &b));
+        // Bigger than a chunk: one of its own, a power of two.
+        let big = region(&mut pool, 100 << 20);
+        assert_eq!((big.offset, big.first), (0, true));
+        assert!(!same(&a, &big));
+        let after = region(&mut pool, 10);
+        assert_eq!((after.offset, after.first), (100 << 20, false));
+        // After a reset the first chunk serves again, from COMMON.
+        pool.reset();
+        let again = region(&mut pool, 10);
+        assert_eq!((again.offset, again.first), (0, true));
+        assert!(same(&a, &again));
+        assert_eq!(made, [MESH_CHUNK_FIRST, 128 << 20]);
+    }
+
+    #[test]
+    fn recycling_keeps_the_uav_state_and_reuses_the_region() {
+        let host = super::host().expect("a D3D12 device");
+        let mut pool = Pool::default();
+        let first = pool.region(4096, |_| Some(buffer(&host.device))).unwrap();
+        assert!(first.first);
+        pool.recycle();
+        let again = pool.region(4096, |_| panic!("the existing chunk must serve")).unwrap();
+        assert_eq!(first.buffer.as_raw(), again.buffer.as_raw());
+        assert_eq!(again.offset, 0);
+        assert!(!again.first, "recycling keeps the UAV state; reset returns to COMMON");
+    }
+
+    #[test]
+    fn a_list_starts_small_and_its_chunks_double_up_to_the_cap() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        // Regions of 768 KiB: one per chunk until the chunks hold more.
+        for _ in 0..12 {
+            pool.region(768 << 10, |size| {
+                made.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap();
+        }
+        assert!(made.starts_with(&[MESH_CHUNK_FIRST, 2 << 20, 4 << 20]), "{made:?}");
+        assert!(made.iter().all(|&s| s <= MESH_CHUNK));
+        // 12 regions of 768 KiB fit in 1 + 2 + 4 + 8 MiB: four chunks.
+        assert_eq!(made.len(), 4, "{made:?}");
+        // A list with one small draw keeps 1 MiB, not 64.
+        let mut small = Pool::default();
+        let mut one = Vec::new();
+        small
+            .region(4096, |size| {
+                one.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap();
+        assert_eq!(one, [MESH_CHUNK_FIRST]);
+    }
+
+}

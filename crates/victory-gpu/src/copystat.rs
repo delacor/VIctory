@@ -1027,6 +1027,7 @@ fn log_memory() {
             ("host lists alive", alive[0]),
             ("lists never reset", lists[3]),
             ("list scratch live", alive[2]),
+            ("mesh scratch held/free/delayed", crate::host::mesh_scratch_bytes()),
             ("list scratch spare", alive[4]),
             ("list other uploads", alive[7]),
             ("private growth making lists", lists[2]),
