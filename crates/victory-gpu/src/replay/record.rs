@@ -1910,10 +1910,39 @@ unsafe extern "system" fn copy_descriptors(
     }
 }
 
+/// Whether we run under Wine (its ntdll exports `wine_get_version`), as
+/// `xmem` asks it.
+fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
     // SAFETY: `n` closed lists, as D3D12 asks; the state is the queue's.
     unsafe {
-        let go = || own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+        // vkd3d-proton takes a list for its own only if it points at its own
+        // method table (else it reads through a null list and the process
+        // ends), so under Wine the lists point at theirs while they are sent.
+        // They are closed: nothing else calls them meanwhile.
+        let go = || {
+            let all = std::slice::from_raw_parts(lists, n as usize);
+            let shims: Vec<usize> = if on_wine() {
+                all.iter().map(|&p| hook::own_table(p)).collect()
+            } else {
+                Vec::new()
+            };
+            own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+            for (&p, &shim) in all.iter().zip(&shims) {
+                hook::put_table(p, shim);
+            }
+        };
         let Some(r) = recorder().filter(|_| !ours()) else {
             return go();
         };

@@ -178,6 +178,31 @@ pub(super) unsafe fn again(
     }
 }
 
+/// Points the object at its own table for a while, if it points at a shim
+/// of ours; what it pointed at before, for [`put_table`].
+///
+/// # Safety
+/// `this` is a live COM object no other thread calls until [`put_table`].
+pub(super) unsafe fn own_table(this: *mut c_void) -> usize {
+    // SAFETY: the caller's.
+    unsafe {
+        let at = table(this);
+        if MADE.lock().unwrap_or_else(|e| e.into_inner()).contains(&at) {
+            this.cast::<*const usize>().write((*shim(this)).orig);
+        }
+        at
+    }
+}
+
+/// Points the object at `at` again, as [`own_table`] answered.
+///
+/// # Safety
+/// As [`own_table`].
+pub(super) unsafe fn put_table(this: *mut c_void, at: usize) {
+    // SAFETY: the caller's.
+    unsafe { this.cast::<usize>().write(at) };
+}
+
 /// Gives the object its own table back, if it points at a shim of ours
 /// (tests).
 ///
