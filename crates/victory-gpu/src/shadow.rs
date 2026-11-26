@@ -5638,12 +5638,37 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking that last took it; the askings so far and
+/// misses left before another idle sweep.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, usize)> = Mutex::new((0, BTreeMap::new(), 0));
+
+const EXACT_MISS_BATCH: usize = 8;
+const EXACT_RECENT_ASKS: u64 = 512;
+
+/// The eligibility rules are unchanged; amortize the full map walk over a
+/// bounded number of new views instead of repeating it on every miss. An idle
+/// copy can stay for at most seven extra misses before it is considered again.
+fn trim_exact(
+    map: &mut BTreeMap<(u64, u64), (Arc<Shadow>, u64)>,
+    now: u64,
+    misses_left: &mut usize,
+) -> bool {
+    if *misses_left != 0 {
+        *misses_left -= 1;
+        return false;
+    }
+    *misses_left = EXACT_MISS_BATCH - 1;
+    map.retain(|_, (shadow, used)| {
+        Arc::strong_count(shadow) > 1
+            || crate::host::references(&shadow.buffer) > 1
+            || now.saturating_sub(*used) < EXACT_RECENT_ASKS
+    });
+    true
+}
 
 /// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5662,10 +5687,8 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
+    /// Copies kept before the idle ones are looked for.
     const MANY: usize = 256;
-    const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
@@ -5673,7 +5696,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
+    let (tick, map, misses_left) = &mut *guard;
     *tick += 1;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
@@ -5681,12 +5704,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    if map.len() >= MANY && trim_exact(map, now, misses_left) {
+        EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -5706,17 +5725,55 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, sweeps] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept, {:.1} idle sweeps per frame",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        sweeps as f64 / frames
     );
+}
+
+
+#[cfg(test)]
+mod exact_cache_tests {
+    use super::*;
+
+    #[test]
+    fn batched_sweeps_keep_live_views_and_eventually_release_idle_copies() {
+        let host = host().expect("a D3D12 device for the real resource ownership check");
+        let mut map = BTreeMap::new();
+        for n in 0..4 {
+            let (buffer, data) = host.shared_buffer(256).unwrap();
+            // SAFETY: the resource is a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shadow = Arc::new(Shadow::new(buffer, data, gpu, n * 4096, 256));
+            map.insert((n * 4096, 256), (shadow, if n == 3 { 1024 } else { 0 }));
+        }
+        let held_copy = map[&(4096, 256)].0.clone();
+        let held_view = map[&(8192, 256)].0.buffer.clone();
+        let mut misses_left = 0;
+        trim_exact(&mut map, 1024, &mut misses_left);
+
+        assert!(!map.contains_key(&(0, 256)), "an old unreferenced copy is freed");
+        assert!(Arc::ptr_eq(&map[&(4096, 256)].0, &held_copy));
+        assert!(map.contains_key(&(8192, 256)), "a live host view retains its copy");
+        assert!(map.contains_key(&(12288, 256)), "a recently used copy is retained");
+        drop(held_copy);
+        drop(held_view);
+
+        // Once the views are released and the grace period expires, the
+        // bounded sweep delay must not turn the cache into a permanent leak.
+        for _ in 0..EXACT_MISS_BATCH {
+            trim_exact(&mut map, 2048, &mut misses_left);
+        }
+        assert!(map.is_empty());
+    }
 }
 
 #[cfg(test)]
