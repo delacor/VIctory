@@ -13132,15 +13132,20 @@ impl<'a> Lower<'a> {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let mut i = self.s.m.bin(c, Bin::And, i, mask);
-            if let Some(first) = first {
-                i = self.s.m.bin(c, Bin::Add, i, first);
-            }
+            // The declared vertex bound is local to this mesh group. The
+            // fallback's offset selects a group in the combined output buffer.
             if let Some(n) = written {
                 let n = self.s.m.i32(n);
                 let past = self.s.m.cmp(c, pred::IUGE, i, n);
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
             }
-            indices.push(self.s.m.select(c, culled, z, i));
+            indices.push(i);
+        }
+        for i in &mut indices {
+            if let Some(first) = first {
+                *i = self.s.m.bin(c, Bin::Add, *i, first);
+            }
+            *i = self.s.m.select(c, culled, z, *i);
         }
         if self.s.mesh_as_compute {
             self.mesh_out_store(MESH_INDICES, flat, &indices);

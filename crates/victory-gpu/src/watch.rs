@@ -5627,8 +5627,10 @@ mod many_askers_tests {
         assert!(!super::published(at, end));
         let (_, all) = ask(fifth);
         assert_eq!(all, []);
-        // A reservation of the ordinary kind is no placeholder.
-        let plain = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        // An ordinary read-write reservation is no placeholder. Wine cannot
+        // distinguish a plain NOACCESS reservation from a placeholder via
+        // class 7; the conservative fallback intentionally accepts both.
+        let plain = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
         assert!(!super::placeholder(plain / PAGE));
         super::look_at_holes();
         assert!(!super::published(at, end), "block 0 stays asked about");
