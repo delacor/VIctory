@@ -53,6 +53,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
     let lowered = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native: &native,
         p: &p,
         st: &st,

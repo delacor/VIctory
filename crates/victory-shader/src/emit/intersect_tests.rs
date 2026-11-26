@@ -174,6 +174,7 @@ pub(super) fn build_compute_shader(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native,
         p: &p,
         st: &st,
@@ -683,6 +684,7 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
     let io = io::raise(&p, &native).expect("io::raise");
     let r = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native: &native,
         p: &p,
         st: &st,

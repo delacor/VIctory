@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -359,6 +360,7 @@ fn immediate_sampler_chosen_by_control_flow() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
         let io = io::raise(&p, &native).expect("io::raise");
         let lowered = lower::lower(&lower::Parts {
+            mesh_as_compute: false,
             native: &native,
             p: &p,
             st: &st,

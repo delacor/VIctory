@@ -173,6 +173,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
     })
     .expect("lower");
 
@@ -2070,6 +2071,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native: &native,
         p: &p,
         st: &st,

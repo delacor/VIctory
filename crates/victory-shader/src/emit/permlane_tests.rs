@@ -84,6 +84,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
     let io = io::raise(&p, native).expect("io");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
     let result = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native,
         p: &p,
         st: &st,

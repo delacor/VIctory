@@ -95,6 +95,9 @@ mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
+#[cfg(all(test, windows))]
+mod mesh_compute_tests;
+mod mesh_vs;
 mod sampler;
 mod shader;
 mod threading;
@@ -125,6 +128,7 @@ pub use shader::{
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+pub use shader::MESH_OUT_SPACE;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -381,6 +385,150 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
+}
+
+/// What a mesh program translated by [`translate_mesh_as_compute`] writes,
+/// for hosts without mesh shaders (an experiment, issue #3).
+///
+/// The program is a compute shader with the mesh program's thread group,
+/// dispatched with the title's group count in x. It binds the user data,
+/// samplers and root views as any translated shader, and three raw UAVs
+/// in [`MESH_OUT_SPACE`]. Group `g` writes:
+///
+/// * `u0`, vertices: vertex `v` at record `g * max_vertices + v`, each record
+///   [`vertex_dwords`](Self::vertex_dwords) dwords: four per element of
+///   the mesh program's output signature, in signature order, the raw bits
+///   it exports (32-bit floats or integers as the element declares).
+/// * `u1`, triangles: primitive `p` at record `g * max_primitives + p`, three
+///   32-bit indices into `u0`'s records (the group's first vertex added).
+///   Triangles no lane exports, or exports culled, are `0, 0, 0` (no area),
+///   so an indexed draw of `3 * max_primitives` indices per group draws the
+///   group's triangles.
+/// * `u2`, per-primitive outputs: record `g * max_primitives + p`, four
+///   dwords per element of the primitive signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLayout {
+    /// Lanes per group (`[numthreads(threads, 1, 1)]`).
+    pub threads: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// Dwords per vertex record in `u0`.
+    pub vertex_dwords: u32,
+    /// Dwords per primitive record in `u2` (0: none).
+    pub primitive_dwords: u32,
+}
+
+impl MeshLayout {
+    /// Bytes `groups` groups write to `u0`, `u1` and `u2`.
+    pub fn bytes(&self, groups: u32) -> [u64; 3] {
+        let g = u64::from(groups);
+        [
+            g * u64::from(self.max_vertices) * u64::from(self.vertex_dwords) * 4,
+            g * u64::from(self.max_primitives) * 12,
+            g * u64::from(self.max_primitives) * u64::from(self.primitive_dwords) * 4,
+        ]
+    }
+}
+
+/// A mesh program for hosts without mesh shaders: the compute shader that
+/// runs it, and the vertex shader that draws what it wrote.
+///
+/// To draw `groups` groups: dispatch [`compute`](Self::compute) with
+/// `(groups, 1, 1)` and the `u0`-`u2` buffers of [`MeshLayout::bytes`];
+/// then bind `u0`-`u2` as the root SRVs `t0`-`t2` in [`MESH_OUT_SPACE`] and
+/// draw [`vertex`](Self::vertex) with the title's pixel shader as a
+/// triangle list of `3 * max_primitives * groups`:
+///
+/// * indices, with `u1` as a 32-bit index buffer;
+/// * or, when [`expanded`](Self::expanded), vertices (no index buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshFallback {
+    pub compute: HostShader,
+    pub vertex: HostShader,
+    /// The program has per-primitive outputs: the vertex shader passes them
+    /// on as constant outputs, drawn three unshared vertices per primitive.
+    pub expanded: bool,
+    pub layout: MeshLayout,
+}
+
+/// Translates the mesh program of a console shader container as a compute
+/// shader that writes its vertices and triangles to buffers, and the
+/// vertex shader that draws them ([`MeshFallback`]).
+pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a mesh program",
+        })?;
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // As `translate`: structurisation first, for per-lane descriptors.
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit_mesh_as_compute(&c, &native, &p, &st, &io, &res)
+}
+
+/// [`translate_mesh_as_compute`] for a program whose earlier stages already
+/// ran.
+pub fn emit_mesh_as_compute(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<MeshFallback, ShaderError> {
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh program run as compute that is no mesh program",
+        });
+    };
+    let (compute, _, outputs, prims) = emit_with(c, native, p, st, io, res, true)?;
+    let layout = MeshLayout {
+        threads: ms.threads,
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        vertex_dwords: 4 * outputs.len() as u32,
+        primitive_dwords: 4 * prims.len() as u32,
+    };
+    Ok(MeshFallback {
+        compute,
+        vertex: fallback_vertex_shader(&outputs, &prims, &layout),
+        expanded: !prims.is_empty(),
+        layout,
+    })
+}
+
+/// The vertex shader of a [`MeshFallback`].
+fn fallback_vertex_shader(
+    outputs: &[container::SigElement],
+    prims: &[container::SigElement],
+    layout: &MeshLayout,
+) -> HostShader {
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: mesh_vs::vertex_shader(
+            outputs,
+            prims,
+            layout.vertex_dwords,
+            layout.primitive_dwords,
+        ),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -731,6 +879,22 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let (shader, wave_size, _, _) = emit_with(c, native, p, st, io, res, false)?;
+    Ok((shader, wave_size))
+}
+
+/// Emits a program normally, or as a mesh program run through compute.
+/// Returns the original output signatures so the fallback vertex shader can
+/// consume the records written by the compute shader.
+fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    mesh_as_compute: bool,
+) -> Result<(HostShader, Option<u32>, Vec<container::SigElement>, Vec<container::SigElement>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -794,6 +958,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    let kept = (outputs.clone(), prims.clone());
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -804,6 +969,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        mesh_as_compute,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -828,7 +994,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
     };
-    Ok((shader, wave_size))
+    Ok((shader, wave_size, kept.0, kept.1))
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed
@@ -2284,6 +2450,7 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let l = super::lower::lower(&super::lower::Parts {
+            mesh_as_compute: false,
             native: &native,
             p: &p,
             st: &st,
@@ -2412,6 +2579,7 @@ mod tests {
             let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
             let l = super::lower::lower(&super::lower::Parts {
+                mesh_as_compute: false,
                 native: &native,
                 p: &p,
                 st: &st,
@@ -2570,6 +2738,7 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let l = super::lower::lower(&super::lower::Parts {
+            mesh_as_compute: false,
             native: &native,
             p: &p,
             st: &st,

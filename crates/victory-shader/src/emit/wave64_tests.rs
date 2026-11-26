@@ -120,6 +120,7 @@ fn lowered_counted(
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
     let lowered = lower::lower_counted(&lower::Parts {
+        mesh_as_compute: false,
         native,
         p,
         st: &st,
@@ -258,6 +259,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(64));
     let lowered = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native,
         p,
         st: &st,
@@ -1175,6 +1177,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let lowered = lower::lower(
         &lower::Parts {
+            mesh_as_compute: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1291,6 +1294,7 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
     let io = io::raise(&p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let lowered = lower::lower(&lower::Parts {
+        mesh_as_compute: false,
         native,
         p: &p,
         st: &st,

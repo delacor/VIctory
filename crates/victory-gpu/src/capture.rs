@@ -152,7 +152,16 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    // A single game-only capture requested by the local test controller.
+    static REQUESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let requested = REQUESTED.load(std::sync::atomic::Ordering::Relaxed) == n || folder().is_some_and(|folder| {
+        let trigger = folder.join("now");
+        trigger.is_file() && std::fs::remove_file(trigger).is_ok()
+    });
+    if requested {
+        REQUESTED.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    folder().is_some() && (requested || n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
