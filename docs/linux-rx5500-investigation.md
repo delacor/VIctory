@@ -15,6 +15,15 @@ The later barycentric experiment renders the character and surrounding scene,
 but some detail remains incorrect and timing is still around 3–4 FPS. This is not a successful performance
 baseline, and no result here establishes 20 FPS.
 
+The pooled-view-buffer A/B run now measures a warmed improvement at comparable
+draw counts: 267.7 ms/frame (3.74 FPS) with committed buffers versus
+194.0 ms/frame (5.15 FPS) with pooled allocations. This uses three completed
+30-second off/on pairs, each starting at least 90 seconds after first 3D,
+with mean draw counts differing by less than 5%. No compiler or sampling
+profiler ran during those pairs. The ray-tracing structure builder remains
+disabled by the fork's default on both sides; this is not a full-feature or
+20-FPS verification.
+
 A previous run showed incomplete scenery. Correctness must be checked alongside
 timing: black frames, omitted draws, or missing geometry cannot count as a gain.
 Subtitles On and HUD Always have been requested but have not yet been verified
@@ -107,8 +116,70 @@ Local commit 37d89d3b5 sweeps once per eight misses, preserving the existing
 reference/age eligibility checks and delaying reconsideration by at most seven
 new views. Its regression uses actual D3D12 resources to check live Arc references,
 live host-view references, recency and eventual idle reclamation. The real-resource ownership/reclamation test and optimized Windows test build
-pass, as does the optimized Windows application build. Performance replay is
-pending; no FPS gain is claimed for this change.
+pass, as does the optimized Windows application build. The cache-only replay completed 360 seconds in 3D without an exception or GPU
+reset and had median 3.9 FPS (range 3.4–5.6 over 65 compilation-idle log samples).
+Its initial CPU profile had different draw/decompression load, so a causal FPS
+gain is not established for the sweep batching alone.
+
+### Exact-view allocations and GPU mapping waits
+
+The cache-only replay created over 300,000 small shared-buffer resources.
+Every committed buffer passes through the fork's resident/mapped path, which
+submits a small copy to a separate queue and waits for its fence. The cumulative
+mapping-wait statistic includes lock waits across threads; it must not be added
+to the wall-frame budget.
+
+Upstream 6cc6aa352 addresses this class of allocations with shared arena slices.
+This fork's descriptor slots retain ID3D12Resource references, and its exact cache
+uses their per-resource reference counts for eviction. Local b7a32f2ed instead
+reuses the existing placed-resource pool with CUSTOM WRITE_BACK/L0 heaps:
+
+- Each view remains a distinct resource of its original width, starting at its
+  own byte zero. Descriptors and copy-back offsets retain their existing meaning.
+- New heaps are made resident and waited for before publishing any placed
+  resource. Reusing a heap does not repeat that wait.
+- A COM reclamation object returns a piece after the last resource reference
+  goes. Existing resting/reclamation rules keep the heap alive.
+- Reused resource bytes are explicitly zeroed, including the missing-title-page
+  case. A refused placement falls back to the original committed-buffer path.
+- VICTORY_VIEW_POOL=0 selects the original path. Diagnostic builds can alternate
+  it through VICTORY_AB=30,VICTORY_VIEW_POOL.
+
+An idle-GPU benchmark of 256 small buffers measured 148.03 us/resource for
+committed buffers and 29.90 us/resource for placed buffers, including one new
+shared heap. This is approximately 5 times faster allocation, not 5 times the FPS.
+Twelve focused correctness checks passed: eleven pool checks (including actual
+GPU UAV writes/readback and COM lifetime) plus the existing misaligned-view
+descriptor/refresh regression. Optimized Windows builds passed.
+
+The live A/B timing above is a separate measurement. No exception or GPU fault
+was logged during its six-minute 3D observation window. Complete rendering is
+not established.
+
+The existing copy benchmark also checked 128 MiB of scattered source memory.
+For 64-KiB pieces, protected rep-movsb copied into a GPU-readable write-back
+buffer at 8.3 GB/s and into plain memory at 8.4 GB/s (memcpy 9.0/9.1 GB/s).
+This does not support treating the shared destination as slow uncached memory.
+Smaller-piece measurements and their overhead remain in the private logs.
+
+### Mesh scratch size and allocation churn
+
+The fork's mesh pools began with 16 MiB even for a few command words. Imported
+allocator regressions from upstream 9398d08 reproduced that policy: both failed
+before the change, including an observed [16 MiB,128 MiB] allocation sequence
+where [1 MiB,128 MiB] was expected.
+
+Local d9e5ad914 starts at 1 MiB and doubles later chunks up to the existing
+16-MiB growth limit. A larger requested region still gets its required
+power-of-two allocation; no geometry or group count is reduced. The fork
+already recycles after each draw, so its recycling, global free-pool limit and
+delayed retirement are retained rather than importing upstream's pool-wrap
+policy.
+
+All three allocator checks pass after the change, including preservation of
+UAV state across recycling. The optimized Windows application build passes.
+VICTORY_MESH_SMALL_CHUNKS=0 selects the old sizing; diagnostics can alternate
+it. Live timing and memory comparison are pending.
 
 ### Rejected write-watch experiment
 
@@ -203,7 +274,9 @@ below are not presented as newly authored fixes.
 | Frame unwind guard | 7900XTX #375, 71eb8c58b4 | 95e95d5c1; included in both subsequent six-minute observation windows |
 | Fence ownership | fxceless #404, plus local async-lane adaptation | 80548d943 + 7fe2b6869; held ownership and six async-lane tests passed |
 | Linear sampler in source root-signature reader | Local correction to the #338 port | 1bedfd6ce; signature unit test and GPU pixel readback passed |
-| Batched exact-view cache maintenance | New correction, 37d89d3b5 | Real-resource lifetime/reclamation test passed; FPS comparison pending |
+| Batched exact-view cache maintenance | New correction, 37d89d3b5 | Real-resource test passed; cache-only replay median 3.9 FPS, effect not isolated |
+| Placed exact-view buffer pool | Fork adaptation, b7a32f2ed; upstream arena motivation 6cc6aa352 | Twelve focused correctness checks; warm A/B 3.74 to 5.15 FPS |
+| Small first mesh scratch chunk | Adapted from upstream 9398d08, d9e5ad914 | Two allocator tests fail before; three pass after; live timing pending |
 
 The earlier stable integration also preserves the narrowed VOP1-only shader
 decoder fix (f4d713fd9) and the split HLE page/shown versus physical-map locks
@@ -291,7 +364,14 @@ has been merged.
   Full scene correctness is not established.
 - Batched exact-cache maintenance: optimized Windows test build and actual
   D3D12 resource-ownership/reclamation test passed. Optimized Windows application
-  build passed; performance replay pending.
+  build passed; six-minute cache-only replay completed. A causal FPS gain is not
+  established for batching alone.
+- Placed exact-view buffer pool: twelve focused correctness checks and optimized
+  Windows builds pass; allocation microbenchmark and three warm live A/B pairs
+  measured separately.
+- Small first mesh scratch chunk: two fail-before allocator regressions; all
+  three after-change checks and optimized Windows application build pass.
+  Live comparison pending.
 
 ## Submission plan
 
@@ -333,6 +413,52 @@ Their descriptor layout has not been established. Do not turn these into fake
 successful calls: that would hand invalid pipeline objects to the title. Diagnose
 these separately from the now-reproduced barycentric capability rejection.
 
+## Remaining omitted work: a diagnostic-label correction
+
+The frame line labels the entire DROPPED counter as without a host pipeline.
+That counter also includes intentionally disabled stages and binding failures.
+The detailed warmed run identifies the remaining roughly 220–270 omissions
+per frame as stages of the ray-tracing structure builder, which is off by
+default unless VICTORY_BVH_BUILDER=1. These are not hundreds of new graphics
+PSO creation errors.
+
+Keep this omission explicit when reporting FPS. Testing the builder and its
+dependencies is separate from the allocation A/B comparison; neither side of
+that comparison changes its setting. The unimplemented device slots above are
+a separate confirmed limitation, not an established explanation of this
+particular counter.
+
+## Full refresh at 2026-11-26 23:42 UTC
+
+All open-PR pages were fetched again, in creation order, across all eight
+repositories: 3,022 unique entries, no duplicate entries or request errors.
+This remains metadata/title/body triage, not validation of every code patch.
+
+| Repository | Open entries | Pages |
+| --- | ---: | ---: |
+| Marvisak/VIctory | 1,566 | 16 |
+| fxceless/victory-fork | 933 | 10 |
+| Belobug/VIctory-Belobug-AMD | 194 | 2 |
+| avatarmanz/VIctory-7900XTX | 191 | 2 |
+| DexNom/VIctory | 115 | 2 |
+| myokex/victory-amd | 22 | 1 |
+| FQY55kai/ZJOU-VICTORY | 0 | 1 |
+| DoubleGhosty/cool_fox | 1 | 1 |
+
+PR lists can change while paging; these are a complete paginated sweep, not an
+atomic snapshot. Raw refreshed metadata is outside the source tree.
+
+All eight known fork branches were fetched as well. Relevant new heads include
+fxceless/main 4c6046614, Belobug/a-publier 4eb6cfdf9, 7900XTX/main 014d52ded,
+DexNom/main 8114ff779 and cool_fox/main ee11ca780. Marvisak main remains 63bcca43c.
+The candidate is not yet merged with every newly fetched change.
+
+The new fxceless default for one group per GPU hash piece was checked against
+the candidate's actual kernel: this fork already uses one 64-thread group per
+piece, so importing that default change is unnecessary. New Belobug work
+includes descriptor-sync range fixes, crash-unwind checks and fingerprinted
+warm failures; compatibility review is pending.
+
 ## Local evidence index
 
 Persistent runtime artifacts are outside Git under the session's SSD runtime
@@ -343,6 +469,8 @@ directory, perf20/runs/<UTC start>. Relevant run IDs:
 | 20261126T221558Z | Confirmed access violation; Wine misleadingly returned zero |
 | 20261126T224506Z | Fence/compositor replay; 363.8 s observed in 3D, median 3.9 FPS, controller stopped |
 | 20261126T225407Z | Barycentric opt-in: 363.4 s in 3D without logged exception/reset, median 3.5 FPS; visible character/scene, separate CPU profile |
+| 20261126T230548Z | Cache-only: 360.1 s observed in 3D, median 3.9 FPS, controller stopped |
+| 20261126T232619Z | View-pool A/B: three warm matched pairs, 267.7 ms off versus 194.0 ms on; builder disabled on both sides |
 
 The private report directory out/pr-sync-2026-11-26/perf20 contains the complete
 PR inventory, selection dispositions, build/test exit files, and offline pipeline

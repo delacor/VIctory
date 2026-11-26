@@ -56,3 +56,15 @@ unchanged here. Its real-resource regression and optimized Windows builds pass;
 its game timing is pending. Review the other draft for that independent change.
 A broader port of upstream's arena should preserve all slice offsets, descriptor
 addresses and refresh/lifetime rules, and needs its own validation.
+
+## Additional fork-only adaptations
+
+The 7900XTX draft records b7a32f2ed (placed-resource pooling) and d9e5ad914
+(smaller first mesh chunks). Main already has the denser shared-buffer arena;
+do not submit a duplicate pool implementation here. The mesh sizing originates
+in upstream PR #961 and should be coordinated with that fallback, rather than
+presented as newly invented code.
+
+The view-pool live A/B improvement is about 3.74 to 5.15 FPS in the existing
+feature profile. The ray-tracing structure builder is disabled in that profile.
+No complete-rendering or 20-FPS claim is supported.

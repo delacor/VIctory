@@ -90,3 +90,36 @@ scan. Marvisak main already uses a weak cache with size-triggered pruning and
 a shared-buffer arena (6cc6aa352). Do not open the same batching PR against
 Marvisak main; a tested adaptation of its broader arena design may supersede
 this smaller fork-specific stopgap.
+
+## 4. Pool exact-view resources in resident write-back heaps
+
+Local b7a32f2ed preserves the fork's per-resource descriptor/lifetime model while
+sharing 64-MiB CUSTOM WRITE_BACK/L0 heaps for small exact-view buffers. Each
+view still has a distinct resource of its original width and offset zero.
+Heap residency/mapping waits happen when a heap is created. Reused bytes are
+zeroed; COM lifetime returns a piece only after the last resource reference.
+
+Twelve correctness checks pass, including actual GPU UAV/readback and the
+existing descriptor/refresh regression. Idle-GPU allocation measured
+148.03 us/resource committed versus 29.90 us pooled. A separate live A/B run,
+with three warm matched off/on pairs and similar draw counts, measured
+267.7 ms/frame (3.74 FPS) versus 194.0 ms/frame (5.15 FPS). No compiler or
+sampling profiler ran during those pairs.
+
+This trades coarser placement alignment for fewer committed allocations. Main's
+shared arena is denser and already solves the same class of problem through a
+different ownership model; this is a fork adaptation, not a duplicate PR for
+Marvisak main. The ray-tracing builder remains disabled on both sides of the
+comparison, so this is not full-feature or 20-FPS validation.
+
+## 5. Small first mesh scratch chunks
+
+Local d9e5ad914 adapts upstream 9398d08 by Eduardo Bertozzi. Begin at 1 MiB and
+double later chunks to the existing 16-MiB growth limit; larger regions still
+allocate the requested power of two. Preserve the fork's per-draw recycling
+and delayed retirement.
+
+Two imported allocator tests fail on the original 16-MiB minimum and pass after
+the change. A third verifies recycling retains UAV state. Optimized Windows
+build passes; live timing and memory comparison are pending. This belongs with
+the compute fallback prerequisite and remains separate from the view-buffer pool.
