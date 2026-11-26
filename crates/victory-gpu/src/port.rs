@@ -346,6 +346,19 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
 
+    /// A fixture for hosts where opening the section-backed heap succeeds
+    /// but the GPU sees a different allocation. Run only on those hosts.
+    #[test]
+    #[ignore = "requires Wine and a device that cannot alias a section-backed heap"]
+    fn a_section_import_without_shared_bytes_is_rejected() {
+        let _turn = crate::indirect::tests::warp_turn();
+        assert!(on_wine(), "this fixture exercises the Wine gate");
+        let device = victory_shader::emit::host::create_preferred_device().expect("a D3D12 adapter");
+        assert!(!crate::inplace::section_views_seen(&device));
+        assert!(matches!(open_region(&device, K64, 2 * K64), Err((5, _))));
+        println!("section-backed heap rejected before opening title memory");
+    }
+
     /// Only the title's 32-bit memory is asked for.
     #[test]
     fn only_memory_below_4_gib_is_wanted_with_the_switch() {
