@@ -259,6 +259,7 @@ fn filter(name: &str) -> Option<D3D12_FILTER> {
         "FILTER_MIN_LINEAR_MAG_MIP_POINT" => D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
         "FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR" => D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
         "FILTER_MIN_MAG_LINEAR_MIP_POINT" => D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        "FILTER_MIN_MAG_MIP_LINEAR" => D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         "FILTER_ANISOTROPIC" => D3D12_FILTER_ANISOTROPIC,
         "FILTER_COMPARISON_MIN_MAG_MIP_POINT" => D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
         "FILTER_COMPARISON_MIN_MAG_MIP_LINEAR" => D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
@@ -403,5 +404,17 @@ fn serialize(device: &ID3D12Device, sig: &Sig) -> windows::core::Result<ID3D12Ro
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         device.CreateRootSignature(0, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_series_s_compositor_signature_keeps_its_linear_sampler() {
+        let source = include_str!("compose.rs");
+        let sig = source.split("#define RS \"").nth(1).unwrap().split('"').next().unwrap();
+        let parsed = super::parse(sig).expect("the real compositor root signature");
+        assert_eq!(parsed.samplers.len(), 1);
+        assert_eq!(parsed.samplers[0].Filter, windows::Win32::Graphics::Direct3D12::D3D12_FILTER_MIN_MAG_MIP_LINEAR);
     }
 }
