@@ -284,7 +284,9 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
+            let began = std::time::Instant::now();
             self.look(limit);
+            crate::critical::worker(began.elapsed().as_nanos() as u64);
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);

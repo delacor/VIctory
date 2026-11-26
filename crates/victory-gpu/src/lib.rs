@@ -27,6 +27,8 @@ mod texstore;
 mod capture;
 #[cfg(windows)]
 mod compose;
+#[cfg(windows)]
+pub(crate) mod critical;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

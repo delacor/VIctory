@@ -570,6 +570,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    #[cfg(windows)]
+    let _critical = crate::critical::Timed::new(crate::critical::execute);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     #[cfg(windows)]
@@ -923,6 +925,8 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
+    #[cfg(windows)]
+    let _critical = crate::critical::Timed::new(crate::critical::present);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     // Submissions sent to the card and not waited for are settled first,

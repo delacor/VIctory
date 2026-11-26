@@ -260,7 +260,9 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
+            let timed = crate::critical::call_timer();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            drop(timed);
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
