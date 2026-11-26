@@ -53,6 +53,10 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    if let Ok(mut pool) = VIEW_BUFFERS.try_lock() {
+        let limit = if crate::residency::critical_commit() { 0 } else { 2 };
+        pool.reclaim(tick, limit, true);
+    }
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
@@ -366,6 +370,12 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::with_rest(STAGING_KEPT, STAGING_REST));
+/// Separate write-back heaps for exact views. Each view remains a resource
+/// of its own, so buffer offsets and resource-reference lifetime checks keep
+/// their existing meaning. Only heap allocation and mapping waits are shared.
+static VIEW_BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(2));
+static VIEW_HELD: AtomicU64 = AtomicU64::new(0);
+static VIEW_BLOCKS_MADE: AtomicU64 = AtomicU64::new(0);
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -425,6 +435,94 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     Some((owned, memory.0, piece.start, data))
 }
 
+
+fn view_pool_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_VIEW_POOL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Write-back memory for one exact view, in a shared heap. A placed buffer
+/// still starts at byte zero of its own resource; no descriptor, refresh or
+/// copy-back path has to know where the resource lies in that heap.
+pub(crate) fn view_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !view_pool_on() {
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    // SAFETY: a valid buffer description; the result supplies the host's
+    // actual placement size and alignment, rather than assuming 64 KiB.
+    let info = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) };
+    if info.SizeInBytes == u64::MAX || info.SizeInBytes > BLOCK / 2 {
+        return None;
+    }
+    let (piece, heap, _) = lock(&VIEW_BUFFERS).take(info.SizeInBytes, info.Alignment.max(1), now(), || {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain heap creation, made resident and mapped before any
+        // view can publish a resource from it. Existing heaps need no new wait.
+        unsafe { host.device.CreateHeap(&desc, &mut heap) }.ok()?;
+        let heap = heap?;
+        crate::host::resident(&host.device, &heap).and_then(|()| crate::host::mapped(&host.device)).ok()?;
+        let n = VIEW_BLOCKS_MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(blocks_made = n, block_mib = BLOCK >> 20, "write-back heap for exact-view buffers made");
+        Some(heap)
+    })?;
+    let mut buffer: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: an exclusive, correctly aligned piece of a resident heap.
+    // The pool keeps the heap while the piece is live or resting.
+    let made = unsafe {
+        host.device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+            .and_then(|()| buffer.as_ref().ok_or_else(windows::core::Error::empty)?.Map(0, None, Some(&mut data)))
+    };
+    match (made, buffer) {
+        (Ok(()), Some(buffer)) => {
+            // A reused placed allocation has no zero-initialization promise.
+            // A missing title page must still read zeros, as with a fresh copy.
+            // SAFETY: the resource's live mapping, exclusively owned here.
+            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, bytes.max(1) as usize) };
+            VIEW_HELD.fetch_add(piece.len, Ordering::Relaxed);
+            give_back_with(&buffer, piece, ReclaimKind::ViewBuffer);
+            crate::host::MADE[2].fetch_add(1, Ordering::Relaxed);
+            crate::host::MADE[3].fetch_add(bytes, Ordering::Relaxed);
+            Some((buffer, data.cast()))
+        }
+        _ => {
+            lock(&VIEW_BUFFERS).give(piece, now());
+            None
+        }
+    }
+}
+
+/// Reserved and occupied placement bytes for exact-view buffer heaps.
+pub(crate) fn view_memory() -> [u64; 2] {
+    [lock(&VIEW_BUFFERS).blocks() as u64 * BLOCK, VIEW_HELD.load(Ordering::Relaxed)]
+}
+
 /// An object the host texture holds and releases when it goes: its piece
 /// is free then.
 #[repr(C)]
@@ -432,6 +530,13 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    kind: ReclaimKind,
+}
+
+#[derive(Clone, Copy)]
+enum ReclaimKind {
+    Texture,
+    ViewBuffer,
 }
 
 struct Methods([*const (); 3]);
@@ -468,8 +573,16 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            match gone.kind {
+                ReclaimKind::Texture => {
+                    HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&TEXTURES).give(gone.piece, now());
+                }
+                ReclaimKind::ViewBuffer => {
+                    VIEW_HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&VIEW_BUFFERS).give(gone.piece, now());
+                }
+            }
         }
         left
     }
@@ -632,9 +745,9 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, kind: ReclaimKind) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, kind }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -704,7 +817,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, ReclaimKind::Texture);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -954,6 +1067,124 @@ mod tests {
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_pool_tests {
+    use super::*;
+
+    #[test]
+    fn placed_view_buffers_keep_their_piece_until_the_last_resource_reference() {
+        let host = crate::host::host().expect("a D3D12 device");
+        let held_before = VIEW_HELD.load(Ordering::Relaxed);
+        let (a, data) = view_buffer(host, 256).expect("a pooled write-back view buffer");
+        let own = VIEW_HELD.load(Ordering::Relaxed) - held_before;
+        assert!(own >= 256);
+        // SAFETY: the newly mapped buffer is ours and is initially zero.
+        unsafe {
+            assert!(std::slice::from_raw_parts(data, 256).iter().all(|&v| v == 0));
+            std::ptr::write_bytes(data, 0xab, 256);
+        }
+        let kept_by_view = a.clone();
+        drop(a);
+        assert_eq!(VIEW_HELD.load(Ordering::Relaxed), held_before + own);
+
+        let (b, other) = view_buffer(host, 256).unwrap();
+        // SAFETY: both live, separate buffer mappings.
+        unsafe {
+            assert_ne!(data, other);
+            assert!(std::slice::from_raw_parts(data, 256).iter().all(|&v| v == 0xab));
+            assert!(std::slice::from_raw_parts(other, 256).iter().all(|&v| v == 0));
+        }
+        drop(b);
+        assert_eq!(VIEW_HELD.load(Ordering::Relaxed), held_before + own);
+        drop(kept_by_view);
+        assert_eq!(VIEW_HELD.load(Ordering::Relaxed), held_before);
+        // Simulated pool time, as in the staging regression: only pieces whose
+        // resource has already been destroyed can be made available.
+        lock(&VIEW_BUFFERS).rested(u64::MAX);
+        let (_again, data) = view_buffer(host, 256).unwrap();
+        // SAFETY: reused bytes must be zero before a missing title page can read them.
+        assert!(unsafe { std::slice::from_raw_parts(data, 256) }.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn placed_view_buffers_have_independent_uavs_and_resource_relative_offsets() {
+        let host = crate::host::host().expect("a D3D12 device");
+        let (a, data_a) = view_buffer(host, 256).unwrap();
+        let (b, data_b) = view_buffer(host, 256).unwrap();
+        let (output, result) = host.shared_buffer(512).unwrap();
+        let heaps = |flags| unsafe {
+            host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: flags,
+                ..Default::default()
+            }).unwrap()
+        };
+        let cpu_heap = heaps(D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
+        let gpu_heap = heaps(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 64,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        let list = host.new_list().unwrap();
+        // SAFETY: live mappings, descriptors, and an open list. Both source
+        // resources start at their own offset zero despite sharing one heap.
+        unsafe {
+            assert_eq!(a.GetDesc().Width, 256);
+            assert_eq!(b.GetDesc().Width, 256);
+            std::ptr::write_bytes(data_a, 0x11, 256);
+            std::ptr::write_bytes(data_b, 0x22, 256);
+            let cpu = cpu_heap.GetCPUDescriptorHandleForHeapStart();
+            let gpu_cpu = gpu_heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateUnorderedAccessView(&a, None::<&ID3D12Resource>, Some(&desc), cpu);
+            host.device.CopyDescriptorsSimple(1, gpu_cpu, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            list.list.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
+            list.list.ResourceBarrier(&[crate::host::transition(&a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.list.ClearUnorderedAccessViewUint(
+                gpu_heap.GetGPUDescriptorHandleForHeapStart(),
+                cpu,
+                &a,
+                &[0x1234_5678; 4],
+                &[],
+            );
+            list.list.ResourceBarrier(&[crate::host::transition(&a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyBufferRegion(&output, 0, &a, 0, 256);
+            list.list.CopyBufferRegion(&output, 256, &b, 0, 256);
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            let got = std::slice::from_raw_parts(result.cast::<u32>(), 128);
+            assert!(got[..64].iter().all(|&v| v == 0x1234_5678), "GPU writes the first placed resource");
+            assert!(got[64..].iter().all(|&v| v == 0x2222_2222), "the adjacent resource is unchanged");
+        }
+    }
+
+    #[test]
+    #[ignore = "allocation timing experiment"]
+    fn allocation_costs() {
+        let host = crate::host::host().expect("a D3D12 device");
+        const N: usize = 256;
+        for pooled in [false, true] {
+            let before = VIEW_BLOCKS_MADE.load(Ordering::Relaxed);
+            let began = std::time::Instant::now();
+            let buffers: Vec<_> = (0..N).map(|_| {
+                if pooled { view_buffer(host, 2048) } else { host.shared_buffer(2048) }.unwrap()
+            }).collect();
+            let us = began.elapsed().as_secs_f64() * 1e6 / N as f64;
+            assert_eq!(buffers.len(), N);
+            println!("write-back views pooled={pooled}: {us:.2} us/resource; {} new shared heaps", VIEW_BLOCKS_MADE.load(Ordering::Relaxed) - before);
+            drop(buffers);
         }
     }
 }

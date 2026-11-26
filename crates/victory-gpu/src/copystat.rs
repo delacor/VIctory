@@ -1045,6 +1045,8 @@ fn log_memory() {
             ("pipeline library file", kept[4]),
             ("our rust heap", own[..4].iter().sum()),
             ("made upload buffers so far", made[1]),
+            ("exact view heaps reserved", crate::pool::view_memory()[0]),
+            ("exact view placements live", crate::pool::view_memory()[1]),
             ("made shared buffers so far", made[3]),
             ("made card buffers so far", made[5]),
         ];

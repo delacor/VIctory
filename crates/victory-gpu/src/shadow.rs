@@ -5707,7 +5707,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY && trim_exact(map, now, misses_left) {
         EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let host = host()?;
+    let bytes = len.next_multiple_of(256);
+    let (buffer, data) = crate::pool::view_buffer(host, bytes).or_else(|| host.shared_buffer(bytes))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
