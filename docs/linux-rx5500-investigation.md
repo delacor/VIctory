@@ -1,14 +1,18 @@
 # Linux RX 5500 XT investigation
 
-Updated 2026-11-26. This is a working engineering report, not a release claim.
+Updated 2026-11-27 (local date; run timestamps below are UTC). This is a working engineering report, not a release claim.
 The target is sustained 20 real presentation frames per second in the same opening
 3D sequence, with correct scenery and the existing DS4 support retained.
 
 ## Current result and limits
 
-The latest Series S run reached approximately 4.6–4.9 FPS after shader compilation
-settled, then crashed after about five minutes. Hundreds of graphics pipeline
-creations per frame were still refused. This is not a successful performance
+The initial Series S trial reached approximately 4.6–4.9 FPS after compilation
+settled, then crashed after about five minutes. A replay with the fence/compositor
+corrections completed a six-minute 3D observation window without that exception
+or a GPU reset: 66 compilation-idle frame-log samples had median 3.9 FPS
+(range 3.5–5.5). It was then stopped by the controller (exit 143).
+The later barycentric experiment renders the character and surrounding scene,
+but some detail remains incorrect and timing is still around 3–4 FPS. This is not a successful performance
 baseline, and no result here establishes 20 FPS.
 
 A previous run showed incomplete scenery. Correctness must be checked alongside
@@ -28,7 +32,8 @@ in the saved game settings.
 - The tested fork starts at Belobug/VIctory-Belobug-AMD a-publier cd8dfc06a,
   on local branch perf20/linux-rx5500. The last launched executable was
   50ec3f9e9; 95e95d5c1 adds an unwind guard. The fence/compositor candidate at 1bedfd6ce
-  is built and its focused tests pass; replay is pending.
+  passed its focused tests and the six-minute observation window. The document
+  commit is 24255dd04; the later backend experiment uses the same application code.
 - Private vkd3d-proton build: official commit
   71cae091b06571e51446cf2a937f0b04c237c04d. Private Wine server described below.
   Neither replaces the system installation.
@@ -94,8 +99,16 @@ Shader compilation and decompression were not the leading steady-state costs.
 
 The exact shadow cache currently walks its entire map on every miss once it has
 256 entries. It retained around 2,500 entries while admitting about 280–317
-new entries per frame. Bounded or batched eviction is a candidate, not a measured
-fix yet.
+new entries per frame. A second 30-second profile with the barycentric experiment confirms the same
+pattern: 27,255 samples, 11,624 in VIctory, including 2,524 in differ::blocks
+and 543 in the exact-cache retain walk.
+
+Local commit 37d89d3b5 sweeps once per eight misses, preserving the existing
+reference/age eligibility checks and delaying reconsideration by at most seven
+new views. Its regression uses actual D3D12 resources to check live Arc references,
+live host-view references, recency and eventual idle reclamation. The real-resource ownership/reclamation test and optimized Windows test build
+pass, as does the optimized Windows application build. Performance replay is
+pending; no FPS gain is claimed for this change.
 
 ### Rejected write-watch experiment
 
@@ -119,7 +132,7 @@ is unsuitable.
 An earlier trial was killed by the global OOM handler. Memory pressure included
 other session processes, so it must not be misdiagnosed as a shader/GPU crash.
 
-The latest Series S trial, started at 22:15:58 UTC, raised an access violation
+The crashed Series S trial, started at 22:15:58 UTC, raised an access violation
 at approximately 22:21:14 UTC. The first reported frame was ntdll+0x3c268,
 with application frames in queue::behind::Lane::push_behind's immediate
 callback and queue::signal. A second exception occurred in DbgHelp while reporting
@@ -129,7 +142,43 @@ exit status zero despite the confirmed crash; exit status alone is insufficient.
 Queued waits/signals stored raw emulated-fence pointers without retaining COM
 ownership. That is a real lifetime defect. It is a plausible contributor to this
 crash, not a proven diagnosis. The ownership fix must survive a replay beyond the
-previous failure point before it is described as a crash fix.
+previous failure point before it is described as a crash fix. The follow-up ran for 363.8 seconds
+in 3D without the exception, then was stopped deliberately. This is one
+encouraging observation, not proof of the suspected cause.
+
+### Refused graphics pipelines: barycentric requirement
+
+Offline replay selected eight actual refused pipeline records from the latest
+run, including one vertex/pixel pipeline and seven mesh-fallback/pixel pipelines.
+All eight reproduced the same vkd3d rejection: the translated pixel program
+requires barycentrics, but the device capability is not exposed. This is a
+specific cause for those eight failures, not proof about every refused pipeline.
+
+RADV's native fragment-barycentric feature is documented for GFX10.3 and later
+([Mesa release notes](https://docs.mesa3d.org/relnotes/23.2.1.html)).
+The tested RX 5500 XT is RDNA1. Merely supplying a mesh compute fallback does not
+remove a pixel program's separate barycentric requirement.
+
+The private vkd3d source already has an AMD explicit-vertex-parameter path,
+normally gated by an application compatibility profile
+([official vkd3d source](https://github.com/HansKristian-Work/vkd3d-proton/blob/71cae091b06571e51446cf2a937f0b04c237c04d/libs/vkd3d/device_workarounds.c)).
+An experiment adds an explicit, default-off environment opt-in to that existing
+path while retaining its AMD, extension, and subgroup guards. It does not enable
+the profile's unrelated VRS override.
+
+The 13 existing barycentric tests pass with this opt-in, including actual
+hardware pixel readback of partial interpolation. All eight selected cached
+pipelines then create successfully, versus zero of eight before the opt-in.
+The subsequent live capture shows the character and surrounding scene.
+This is a rendering improvement, not complete-image validation or an FPS gain.
+The exact experimental patch is saved as
+[plain-text backend patch](patches/vkd3d-rdna1-barycentric-opt-in.txt).
+
+The backend experiment is not promoted as a full native-feature replacement. The converter calls
+these barycentrics unstable and has incomplete centroid/per-sample handling.
+Further coverage, especially clipped primitives and non-center sampling modes,
+is still required; pipeline creation alone cannot establish image correctness. No shader feature requirement
+is erased and no valid draw is deliberately skipped to improve a timing result.
 
 ## Code and provenance
 
@@ -151,9 +200,10 @@ below are not presented as newly authored fixes.
 | Multi-group mesh index bounds | New correction, 978fd7402 | Second-group indices failed before, passed after |
 | Wine Winsock missing-export handling | VIctory #3091 | e821e6440; affected network test passed |
 | Empty pipeline-library blob handling | 7900XTX #151, both commits | c0d3415e6 + 50ec3f9e9; all five library tests passed |
-| Frame unwind guard | 7900XTX #375, 71eb8c58b4 | 95e95d5c1; replay pending |
+| Frame unwind guard | 7900XTX #375, 71eb8c58b4 | 95e95d5c1; included in both subsequent six-minute observation windows |
 | Fence ownership | fxceless #404, plus local async-lane adaptation | 80548d943 + 7fe2b6869; held ownership and six async-lane tests passed |
 | Linear sampler in source root-signature reader | Local correction to the #338 port | 1bedfd6ce; signature unit test and GPU pixel readback passed |
+| Batched exact-view cache maintenance | New correction, 37d89d3b5 | Real-resource lifetime/reclamation test passed; FPS comparison pending |
 
 The earlier stable integration also preserves the narrowed VOP1-only shader
 decoder fix (f4d713fd9) and the split HLE page/shown versus physical-map locks
@@ -186,7 +236,8 @@ without a redundant raw pointer.
 The imported queue ownership regression passes. All six async-lane tests pass,
 including a regression that releases the caller reference and checks final
 release for Wait, Signal, and joined-signal jobs. The crash replay is a separate
-validation step and is still pending.
+validation step: the six-minute observation window passed without the earlier
+exception, and further repetitions are still needed.
 
 ### Compositor correction
 
@@ -232,7 +283,15 @@ has been merged.
   async-lane tests including the new ownership regression, one signature parser
   test, and one actual GPU compositor image/readback test).
 - Optimized diagnostic Windows application and GPU test builds: passed.
-- Replay with those edits: pending. Latest actual run is a crash, not a clean exit.
+- Fence/compositor replay: six-minute 3D observation window completed without
+  the prior exception or a logged GPU reset, then deliberately terminated by
+  the controller. This does not retroactively make the earlier crash a clean exit.
+- Private barycentric backend: 13 tests passed, including actual hardware
+  rendered-pixel checks; eight previously refused pipeline records now create.
+  Full scene correctness is not established.
+- Batched exact-cache maintenance: optimized Windows test build and actual
+  D3D12 resource-ownership/reclamation test passed. Optimized Windows application
+  build passed; performance replay pending.
 
 ## Submission plan
 
@@ -250,3 +309,42 @@ Before upload: refresh the target PR state, reproduce each regression on its
 intended base, run the focused tests, and replace all pending claims with actual
 results. Keep local crash reports, CPU profile data, shader cache files, and
 screenshots outside Git.
+
+## Target-base check for the cache change
+
+The fetched Marvisak/VIctory main at 63bcca43c already has a different solution:
+weak cache entries, a size-based pruning threshold, and shared arena buffers
+(commit [6cc6aa352](https://github.com/Marvisak/VIctory/commit/6cc6aa352)).
+The fetched 7900XTX main still has the strong-reference per-miss retain scan
+used by the candidate. Therefore 37d89d3b5 is a focused 7900XTX/fork stopgap,
+not a proposed duplicate fix for Marvisak main.
+
+Porting upstream's arena is a broader option, but requires preserving slice
+offsets, descriptor first-element calculations, refreshes and buffer lifetimes
+throughout this fork. It must not be reduced to copying the map declaration.
+Prefer that redesign if it can be adapted and validated; retain the bounded
+sweep as a small independently reviewable change in the meantime.
+
+## Remaining rendering gaps
+
+The live log still reports draws without a host pipeline. Device creation slots
+0x1c8 and 0x218 are explicitly unimplemented and return failure with a null output.
+Their descriptor layout has not been established. Do not turn these into fake
+successful calls: that would hand invalid pipeline objects to the title. Diagnose
+these separately from the now-reproduced barycentric capability rejection.
+
+## Local evidence index
+
+Persistent runtime artifacts are outside Git under the session's SSD runtime
+directory, perf20/runs/<UTC start>. Relevant run IDs:
+
+| Run ID | Meaning |
+| --- | --- |
+| 20261126T221558Z | Confirmed access violation; Wine misleadingly returned zero |
+| 20261126T224506Z | Fence/compositor replay; 363.8 s observed in 3D, median 3.9 FPS, controller stopped |
+| 20261126T225407Z | Barycentric opt-in: 363.4 s in 3D without logged exception/reset, median 3.5 FPS; visible character/scene, separate CPU profile |
+
+The private report directory out/pr-sync-2026-11-26/perf20 contains the complete
+PR inventory, selection dispositions, build/test exit files, and offline pipeline
+before/after logs. These are working evidence, not a PR payload. Public
+submissions should contain code, synthetic tests and this written analysis only.

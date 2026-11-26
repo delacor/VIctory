@@ -1,0 +1,39 @@
+Experimental private vkd3d-proton diagnostic patch
+================================================
+
+Base: HansKristian-Work/vkd3d-proton
+71cae091b06571e51446cf2a937f0b04c237c04d
+
+Opt-in: VKD3D_UNSTABLE_BARYCENTRICS=1 (default off).
+Adds a diagnostic opt-in to the existing AMD compatibility path, retaining
+AMD vendor, explicit-vertex-parameter extension and subgroup-size guards.
+It does not enable the unrelated VRS compatibility feature.
+
+This is a backend experiment, not a VIctory source fix or a verified replacement
+for native fragment barycentrics. The converter's existing fallback has unstable
+vertex ordering and incomplete centroid/per-sample handling. See the investigation
+report for actual test results before using it.
+
+The modified upstream file is LGPL-2.1-or-later; retain its upstream licence
+and copyright when distributing a patched backend. This patch adds no game data.
+
+Apply to the exact backend base with:
+    git apply --check /path/to/this-file.txt
+    git apply /path/to/this-file.txt
+
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+index 8e574ac..6aa6ad1 100644
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -724,3 +724,10 @@ bool d3d12_device_allow_emulated_barycentrics(struct d3d12_device* device)
+ {
+-    return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) &&
++    char compatibility[8];
++    bool explicitly_requested = vkd3d_get_env_var("VKD3D_UNSTABLE_BARYCENTRICS",
++            compatibility, sizeof(compatibility)) && !strcmp(compatibility, "1");
++
++    /* Diagnostic opt-in to the existing AMD path. Keep the extension and
++     * RDNA1 guards, and do not enable the unrelated VRS override. */
++    return ((vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) ||
++            explicitly_requested) &&
+             device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_AMD &&

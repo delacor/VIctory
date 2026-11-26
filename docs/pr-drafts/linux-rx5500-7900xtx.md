@@ -41,10 +41,52 @@ the source PR. It is separate from the mesh correction.
 ## Additional ownership fix
 
 The local async-lane fence ownership adaptation extends fxceless #404. Its held-fence
-regression and all six async-lane tests pass. It still needs a crash replay
-before describing it as a crash fix; see the
+regression and all six async-lane tests pass. One six-minute 3D observation window completed without the earlier exception;
+further repetitions are needed before claiming a crash fix; see the
 VIctory draft and ../linux-rx5500-investigation.md.
 
 Imports from this repository retain their attribution. PRs #151, #200, #271,
 #351, #375, #376 and #377 are dependencies/previous work, not newly authored
 contributions. The full experimental branch is not an appropriate PR payload.
+
+## Backend dependency — separate from the application PRs
+
+The private vkd3d experiment enables its existing AMD explicit-vertex-parameter
+barycentric path with a default-off switch. Thirteen existing shader tests pass,
+including actual GPU pixel readback, and eight real pipeline records that were
+refused before now create successfully. The character and surrounding scene
+are visible in the subsequent replay. Some image detail is still incorrect,
+frame rate remains about 3–4 FPS, and the backend fallback has interpolation
+limitations. Do not present it as native feature support or a 20-FPS result.
+
+Keep that backend patch and its limitations separate from VIctory source fixes.
+The investigation report includes the exact text patch for later review.
+
+## 3. Amortize exact-view cache idle sweeps
+
+Proposed title: Amortize exact-view cache maintenance over eight misses
+
+Two separate steady-state profiles show more than 500 samples inside the
+exact-view cache's full BTreeMap retain walk. It scans around 2,500 entries
+on each miss, with roughly 280–317 new views per frame, under a shared lock.
+
+Local commit 37d89d3b5 keeps the ownership and 512-asking recency checks, but
+walks the map once per eight misses. Eligible idle copies can be reconsidered
+up to seven misses later. This trades bounded extra cache retention for less
+repeated work; it does not omit a draw, copy, or memory write.
+
+The actual D3D12 resource regression passes: an externally held Shadow, a
+buffer still referenced by a host view, and a recent entry survive a sweep;
+after references are released and age expires, idle entries are reclaimed
+within the bounded sweep interval. The optimized Windows test and application builds pass.
+The in-game comparison is pending; no FPS gain is claimed.
+
+Submit only against a base that has this exact-view cache, preserving that
+base's invalidation and reference checks. Keep this separate from correctness
+fixes and the private backend experiment.
+
+The target-base check confirms that fetched 7900XTX main retains this per-miss
+scan. Marvisak main already uses a weak cache with size-triggered pruning and
+a shared-buffer arena (6cc6aa352). Do not open the same batching PR against
+Marvisak main; a tested adaptation of its broader arena design may supersede
+this smaller fork-specific stopgap.
