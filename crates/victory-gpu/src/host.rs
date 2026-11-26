@@ -1611,10 +1611,12 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
+        // Not the blob: under Wine the host refuses the signature inside it
+        // (E_FAIL), while a description read from the source's `RS` and
+        // serialized here works, as the title's own signatures do. The
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root: ID3D12RootSignature = crate::rootstring::make(device, source)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -4400,9 +4402,10 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: live bytecode with an embedded root signature.
+        // Serialize the source signature directly; keep the Wine-aware DXC bytecode.
+        let root = crate::rootstring::make(&self.device, CARD_COMPARE)?;
+        // SAFETY: bytecode remains live through pipeline creation.
         unsafe {
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {

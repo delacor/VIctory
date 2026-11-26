@@ -83,6 +83,8 @@ mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod rootstring;
+#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;

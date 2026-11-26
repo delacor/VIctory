@@ -63,7 +63,7 @@ ByteAddressBuffer count_buf : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -164,8 +164,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -176,7 +175,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -198,17 +197,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -311,9 +310,9 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let bytes = crate::dxc::compile(source, "main", "cs_5_1")?;
-    // SAFETY: the embedded root signature and shader bytecode remain live.
+    let root = crate::rootstring::make(device, source)?;
+    // SAFETY: root signature and bytecode remain live through creation.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
