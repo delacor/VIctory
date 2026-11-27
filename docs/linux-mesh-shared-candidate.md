@@ -21,7 +21,15 @@ API rules reviewed:
 https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12
 https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-executecommandlists
 
-Qualification pending: ignored real GPU regression records 32 lists before
+Qualification passed: the ignored real GPU regression records 32 lists before
 submission, reads each producer through the shared output, checks reverse
 batch order and separate submissions, grows the arena and checks every word
-and retained bytes. No live performance or correctness claim yet.
+and retained bytes. All 64 lists match; retained test storage is 3 MiB.
+Windows all-target check, two barrier/image tests, six indirect tests,
+inline capture, factory reuse and application build pass.
+
+Live same-binary comparison: shared 195.035 ms (5.127 FPS, 51 samples),
+private 199.526 ms (5.012 FPS, 53 samples), warm seconds 120–410.
+The changing scene and unequal draw counts limit attribution of the small
+FPS difference; the goal of 20 FPS remains unmet. See the investigation
+ledger for final/peak memory, limits, logs and the replay smoke-test issue.
