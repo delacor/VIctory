@@ -8886,6 +8886,8 @@ impl Batch {
         }
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
+        crate::critical::refresh_count(0, 1);
+        crate::critical::refresh_count(1, spans.len());
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
@@ -8895,17 +8897,22 @@ impl Batch {
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
-            #[cfg(feature = "diagnostics")]
+            let told = std::time::Instant::now();
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            crate::critical::refresh_part(2, told);
+            crate::critical::refresh_count(3, all - spans.len());
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
+            let asking = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
+            crate::critical::refresh_part(4, asking);
         }
+        let updates = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
@@ -8918,10 +8925,13 @@ impl Batch {
             if many && shadow.nothing_new(*from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                crate::critical::refresh_count(3, 1);
                 return;
             }
             Self::update(shadow, *from, *to);
         });
+        crate::critical::refresh_part(5, updates);
+        crate::critical::refresh_part(7, started);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9027,15 +9037,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let whole = std::time::Instant::now();
+        let textures = std::time::Instant::now();
         self.refresh_textures();
+        crate::critical::refresh_part(6, textures);
         self.index.clear();
         if self.refreshes.is_empty() {
+            crate::critical::refresh_part(7, whole);
             return;
         }
+        crate::critical::refresh_count(0, 1);
+        crate::critical::refresh_count(1, self.refreshes.len());
         #[cfg(feature = "diagnostics")]
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
+        crate::critical::refresh_part(7, whole);
         #[cfg(feature = "diagnostics")]
         {
             SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -9055,10 +9072,11 @@ impl Batch {
         let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
         if light && self.refreshes.len() <= FEW && !beside {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::critical::refresh_part(2, started);
+            crate::critical::refresh_count(3, all - self.refreshes.len());
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -9075,7 +9093,9 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::critical::refresh_part(4, started);
         }
+        let updates = std::time::Instant::now();
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -9092,6 +9112,7 @@ impl Batch {
                     if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        crate::critical::refresh_count(3, 1);
                         return;
                     }
                     Self::update(shadow, *from, *to);
@@ -9111,6 +9132,7 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
+        crate::critical::refresh_part(5, updates);
         if ahead {
             crate::watch::ask_ahead_done();
         }

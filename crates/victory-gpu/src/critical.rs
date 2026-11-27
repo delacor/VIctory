@@ -238,6 +238,7 @@ pub(crate) fn line() {
     );
     // The submissions: our thread's work with VICTORY_ASYNC_SUBMIT, else
     // the time inside the title's ExecuteCommandLists.
+    refresh_line(frames);
     let submission = if t[5] > 0 { t[5] } else { t[3] };
     tracing::info!(
         "chains per frame (VICTORY_CRITICAL_PATH=1): frame {:.1} ms; submission {:.1} ms, recording (the busiest thread) {:.1} ms, relay {:.1} ms",
@@ -263,4 +264,45 @@ impl Drop for Timed {
             to(began.elapsed().as_nanos() as u64);
         }
     }
+}
+
+/// The refreshes' flushes of the submitting thread, since the line
+/// (`VICTORY_CRITICAL_PATH=1`): flushes, refreshes in them; ns telling
+/// those known to copy nothing and how many; ns asking the write watch
+/// ahead; ns of the updates (wall, on the threads beside); ns of the
+/// textures' checks; ns in all.
+pub(crate) static REFRESH: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Adds `ns` since `began` to [`REFRESH`]`[i]` (when on).
+pub(crate) fn refresh_part(i: usize, began: std::time::Instant) {
+    if on() {
+        REFRESH[i].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// Counts `n` in [`REFRESH`]`[i]` (when on).
+pub(crate) fn refresh_count(i: usize, n: usize) {
+    if on() {
+        REFRESH[i].fetch_add(n as u64, Relaxed);
+    }
+}
+
+fn refresh_line(frames: f64) {
+    let r: Vec<u64> = REFRESH.iter().map(|v| v.swap(0, Relaxed)).collect();
+    let ms = |ns: u64| ns as f64 / 1e6 / frames;
+    let per = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "refresh flushes of the submitting thread per frame (VICTORY_CRITICAL_PATH=1): {:.0} flushes of {:.0} refreshes, {:.1} ms in all; \
+         telling those known to copy nothing {:.2} ms ({:.0} told, {:.2} us each); asking the write watch ahead {:.2} ms; \
+         the updates (wall, threads beside) {:.2} ms; the textures' checks {:.2} ms",
+        per(r[0]),
+        per(r[1]),
+        ms(r[7]),
+        ms(r[2]),
+        per(r[3]),
+        if r[3] > 0 { r[2] as f64 / r[3] as f64 / 1e3 } else { 0.0 },
+        ms(r[4]),
+        ms(r[5]),
+        ms(r[6])
+    );
 }
