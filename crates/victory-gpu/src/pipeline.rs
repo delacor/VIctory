@@ -428,6 +428,33 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Independent mesh windows may move compute ahead of earlier raster work.
+/// Reject every image operation, unknown code, buffer store/atomic, control
+/// transfer or hardware-time read. Raster exports and private LDS are local.
+#[cfg(windows)]
+pub(crate) fn mesh_window_readonly(container: &[u8]) -> bool {
+    use victory_shader::gfx10::{Encoding, Fields, decode};
+    let Ok(c) = victory_shader::dxbc::Container::parse(container) else { return false };
+    let mut found = false;
+    for part in c.parts.iter().filter(|part| part.fourcc == victory_shader::dxbc::FourCC(*b"DXIL")) {
+        let Ok(programs) = victory_shader::native_programs(part.data) else { return false };
+        if programs.is_empty() { return false; }
+        for p in programs {
+            found = true;
+            if stores(&p) { return false; }
+            let Ok(code) = decode(&p.code) else { return false };
+            if !code.iter().all(|i| {
+                let Some(name) = i.name() else { return false };
+                !matches!(i.encoding, Encoding::Mimg)
+                    && !matches!(i.fields(p.wave64), Fields::Ds { gds: true, .. })
+                    && !name.contains("memtime") && !name.contains("realtime")
+                    && !name.contains("trap")
+            }) { return false; }
+        }
+    }
+    found
+}
+
 /// Whether a console program can store to memory through raw addresses
 /// (`crate::memory`): a flat or global store or atomic, or code that does
 /// not decode. The programs that only walk ray-tracing structures do not,

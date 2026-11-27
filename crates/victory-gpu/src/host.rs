@@ -1406,6 +1406,7 @@ pub(crate) struct HostList {
     /// Shader-writable memory for what mesh programs run as compute write
     /// (see [`HostList::mesh_scratch`]), reused after a reset.
     mesh_scratch: Mutex<MeshScratch>,
+    pub(crate) mesh_bundles: Mutex<crate::mesh_window::Pool>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -4589,6 +4590,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 mesh_scratch: Mutex::default(),
+                mesh_bundles: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6909,6 +6911,9 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        if let Err(e) = self.mesh_bundles.lock().unwrap_or_else(|e| e.into_inner()).reset() {
+            fail(format_args!("a completed mesh bundle allocator could not reset ({e})"));
+        }
         #[cfg(feature = "diagnostics")]
         for capture in std::mem::take(&mut *self.pass_captures.lock().unwrap_or_else(|e| e.into_inner())) {
             capture.save();

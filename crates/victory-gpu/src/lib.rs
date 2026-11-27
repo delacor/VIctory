@@ -72,6 +72,8 @@ mod mesh_indirect;
 mod mesh_barriers;
 #[cfg(windows)]
 mod mesh_shared;
+#[cfg(windows)]
+mod mesh_window;
 pub mod list;
 pub mod object;
 pub mod pipeline;

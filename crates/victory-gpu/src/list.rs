@@ -150,7 +150,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    let Some(list) = raw_host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -180,6 +180,16 @@ pub(crate) fn tables_done(lists: &[This]) {
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let host = raw_host_list(this)?;
+    if crate::mesh_window::enabled() {
+        // Native GPU operations must not pass deferred raster work.
+        unsafe { (*this.cast::<List>()).state.lock().unwrap_or_else(|e| e.into_inner()).flush_mesh(host); }
+    }
+    Some(host)
+}
+
+#[cfg(windows)]
+pub(crate) fn raw_host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -391,6 +401,7 @@ fn cut(this: This, wait: ValueWait) {
     let Some(current) = list.host.as_ref() else {
         return;
     };
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).flush_mesh(current);
     if current.untouched() {
         list.gate.push(wait);
         return;

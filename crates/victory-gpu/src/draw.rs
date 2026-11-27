@@ -369,10 +369,22 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+enum GraphicsTarget<'a> {
+    Direct(&'a ID3D12GraphicsCommandList),
+    Bundle(ID3D12GraphicsCommandList),
+}
+impl std::ops::Deref for GraphicsTarget<'_> {
+    type Target = ID3D12GraphicsCommandList;
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Direct(list) => list, Self::Bundle(list) => list }
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    mesh_window: Option<crate::mesh_window::Window>,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -452,6 +464,44 @@ impl Drop for State {
 }
 
 impl State {
+    pub(crate) fn flush_mesh(&mut self, list: &HostList) {
+        if let Some(window) = self.mesh_window.take() {
+            if let Err(e) = window.finish(list) {
+                crate::host::fail(format_args!("a mesh graphics window could not close ({e})"));
+            }
+            self.external_compute();
+            self.set_topology(list, self.topology);
+        }
+    }
+
+    fn begin_mesh_window(&mut self, list: &HostList, p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback, bytes: u64) -> bool {
+        let eligible = crate::mesh_window::enabled() && f.window_readonly
+            && bytes != 0 && bytes <= crate::mesh_window::STRIDE
+            && mesh_test() == 0 && f.signatures.as_ref().is_some_and(|s| s.portable);
+        if !eligible {
+            self.flush_mesh(list);
+            return false;
+        }
+        let pipeline = p.pso.as_raw() as usize;
+        if self.mesh_window.as_ref().is_some_and(|w| w.full() || w.pipeline != pipeline || w.heaps != self.heaps) {
+            self.flush_mesh(list);
+        }
+        if self.mesh_window.is_none() {
+            self.mesh_window = crate::mesh_window::Window::new(list, pipeline, self.heaps);
+            // A bundle does not inherit the PSO; force its first graphics bind.
+            self.host_pipeline = 0;
+            self.host_roots[0] = 0;
+        }
+        self.mesh_window.is_some()
+    }
+
+    fn graphics_target<'a>(&self, list: &'a HostList) -> GraphicsTarget<'a> {
+        match &self.mesh_window {
+            Some(window) => GraphicsTarget::Bundle(window.bundle.clone()),
+            None => GraphicsTarget::Direct(&list.list),
+        }
+    }
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -1016,6 +1066,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        // Reset discards an abandoned recording; completed lists flushed at Close.
+        self.mesh_window = None;
         *self = State::default();
         self.pipeline = pipeline as usize;
     }
@@ -1023,6 +1075,8 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        if self.mesh_window.is_some() && self.topology_set && self.topology == topology { return; }
+        self.flush_mesh(list);
         self.topology = topology;
         self.topology_set = true;
         let host = match topology {
@@ -1177,6 +1231,7 @@ impl State {
         {
             return;
         }
+        self.flush_mesh(list);
         self.host_targets = Some(now);
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
@@ -1194,6 +1249,8 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if self.mesh_window.is_some() && self.viewports == viewports { return; }
+        self.flush_mesh(list);
         #[cfg(feature = "diagnostics")]
         if let Some(v) = viewports.first() {
             crate::host::spans::viewport(v.Width as u32, v.Height as u32);
@@ -1204,6 +1261,8 @@ impl State {
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if self.mesh_window.is_some() && self.scissors == rects { return; }
+        self.flush_mesh(list);
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
         if scissor_test() {
@@ -1223,16 +1282,22 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        if self.mesh_window.is_some() && self.blend.as_ref() == factor { return; }
+        self.flush_mesh(list);
         self.blend = factor.copied();
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if self.mesh_window.is_some() && self.stencil == Some(reference) { return; }
+        self.flush_mesh(list);
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        if self.mesh_window.is_some() && self.depth_bounds == Some([min, max]) { return; }
+        self.flush_mesh(list);
         self.depth_bounds = Some([min, max]);
         crate::draw::depth_bounds(list, min, max);
     }
@@ -1461,7 +1526,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
-        let l = &list.list;
+        let l = self.graphics_target(list);
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -1535,6 +1600,7 @@ impl State {
     /// Binds translated stages, reading title roots from `roots` and setting
     /// host bindings on the compute or graphics path selected by `compute`.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if p.compute || !p.mesh { self.flush_mesh(list); }
         self.bind_as(list, p, &p.pso, &p.stages, compute, compute)
     }
 
@@ -1547,7 +1613,7 @@ impl State {
         roots: bool,
         compute: bool,
     ) -> bool {
-        let l = &list.list;
+        let l = if compute { GraphicsTarget::Direct(&list.list) } else { self.graphics_target(list) };
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, roots);
         if crate::host::walls_trace() {
@@ -1891,7 +1957,7 @@ impl State {
                 if compute {
                     list.list.SetComputeRootUnorderedAccessView(param, gpu);
                 } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    self.graphics_target(list).SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
             return true;
@@ -1942,7 +2008,7 @@ impl State {
             if compute {
                 list.list.SetComputeRootDescriptorTable(param, handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                self.graphics_target(list).SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -2025,7 +2091,7 @@ impl State {
             if compute {
                 list.list.SetComputeRootDescriptorTable(param, handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                self.graphics_target(list).SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -3336,12 +3402,18 @@ impl State {
             once!(x, "a mesh fallback draw with more than 4 GiB of indices");
             return false;
         };
+        let windowed = self.begin_mesh_window(list, p, f, at_prims + prims.max(16));
         // Bind before taking a region so a failed bind does not consume the
         // chunk's first-use transition.
         if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
             return false;
         }
-        let Some(region) = list.mesh_scratch(ScratchPool::Data, at_prims + prims.max(16)) else {
+        let region = if windowed {
+            self.mesh_window.as_mut().and_then(|w| w.reserve(at_prims + prims.max(16)))
+        } else {
+            list.mesh_scratch(ScratchPool::Data, at_prims + prims.max(16))
+        };
+        let Some(region) = region else {
             return false;
         };
         list.keep(&region.buffer);
@@ -3357,11 +3429,13 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
+            if let Some(window) = &mut self.mesh_window { window.wrote(); }
             l.Dispatch(x, 1, 1);
-            barriers.between(&region.buffer, Access::Compute, Access::Vertices);
+            if !windowed { barriers.between(&region.buffer, Access::Compute, Access::Vertices); }
         }
         let drawn = self.prepare_for(list, false, true);
         if drawn {
+            let l = self.graphics_target(list);
             unsafe {
                 for (param, at) in f.inputs.into_iter().zip([0, at_indices, at_prims]) {
                     l.SetGraphicsRootShaderResourceView(param, base + at);
@@ -3381,10 +3455,12 @@ impl State {
                     l.DrawIndexedInstanced(n, 1, 0, 0, 0);
                 }
             }
-            self.set_topology(list, self.topology);
+            if !windowed { self.set_topology(list, self.topology); }
         }
-        barriers.between(&region.buffer, Access::Vertices, Access::Compute);
-        list.mesh_scratch_recycle();
+        if !windowed {
+            barriers.between(&region.buffer, Access::Vertices, Access::Compute);
+            list.mesh_scratch_recycle();
+        }
         drawn
     }
     fn indirect_mesh_fallback(
@@ -3416,9 +3492,19 @@ impl State {
             once!(records, "an indirect mesh dispatch too large for the fallback");
             return false;
         };
+        let windowed = if records == 1 {
+            self.begin_mesh_window(list, p, f, regions.bytes)
+        } else {
+            self.flush_mesh(list);
+            false
+        };
+        let data = if windowed {
+            self.mesh_window.as_mut().and_then(|w| w.reserve(regions.bytes))
+        } else {
+            list.mesh_scratch(ScratchPool::Data, regions.bytes)
+        };
         let (Some(data), Some(commands)) = (
-            list.mesh_scratch(ScratchPool::Data, regions.bytes),
-            list.mesh_scratch(ScratchPool::Commands, commands_len),
+            data, list.mesh_scratch(ScratchPool::Commands, commands_len),
         ) else {
             return false;
         };
@@ -3468,9 +3554,10 @@ impl State {
                         }
                     }
                     let offset = if signatures.portable { u64::from(record) * u64::from(COMPUTE_STRIDE) + 24 } else { 0 };
+                    if let Some(window) = &mut self.mesh_window { window.wrote(); }
                     l.ExecuteIndirect(&signatures.compute, if signatures.portable { 1 } else { records },
                         &commands.buffer, commands.offset + offset, None, 0);
-                    barriers.between(&data.buffer, Access::Compute, Access::Vertices);
+                    if !windowed { barriers.between(&data.buffer, Access::Compute, Access::Vertices); }
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3510,6 +3597,7 @@ impl State {
                 let ready = self.prepare_for(list, false, true);
                 drawn |= ready;
                 if ready {
+                    let l = self.graphics_target(list);
                     unsafe {
                         for (param, at) in f.inputs.into_iter().zip([0, regions.indices, regions.prims]) {
                             l.SetGraphicsRootShaderResourceView(param, base + at);
@@ -3530,13 +3618,17 @@ impl State {
                         l.ExecuteIndirect(&signatures.draw, if signatures.portable { 1 } else { records },
                             &commands.buffer, commands.offset + draws + offset, None, 0);
                     }
-                    self.set_topology(list, self.topology);
+                    if !windowed { self.set_topology(list, self.topology); }
                 }
-                barriers.between(&data.buffer, Access::Vertices, Access::Compute);
+                if !windowed { barriers.between(&data.buffer, Access::Vertices, Access::Compute); }
             }
         }
         barriers.between(&commands.buffer, Access::Arguments, Access::Compute);
-        list.mesh_scratch_recycle();
+        if let Some(window) = &mut self.mesh_window {
+            window.commands(&commands.buffer);
+        } else {
+            list.mesh_scratch_recycle();
+        }
         drawn
     }
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -3563,6 +3655,7 @@ impl State {
             }
             return;
         }
+        self.flush_mesh(list);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -4336,6 +4429,7 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        if kind != MESH { self.flush_mesh(list); }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -4424,6 +4518,7 @@ impl State {
             }
             return ran;
         }
+        self.flush_mesh(list);
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);

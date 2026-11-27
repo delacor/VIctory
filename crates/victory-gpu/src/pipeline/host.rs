@@ -401,6 +401,7 @@ pub(crate) struct MeshFallback {
     pub(crate) expanded: bool,
     /// What its indirect mesh dispatches execute (none: they are dropped).
     pub(crate) signatures: Option<crate::mesh_indirect::Signatures>,
+    pub(crate) window_readonly: bool,
 }
 
 pub(crate) struct HostPipeline {
@@ -902,6 +903,7 @@ impl HostPipeline {
                     inputs,
                     expanded: f.expanded,
                     signatures,
+                    window_readonly: shaders.iter().all(|s| super::mesh_window_readonly(&s.container)),
                 }),
                 pso,
                 root,

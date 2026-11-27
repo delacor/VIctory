@@ -398,7 +398,7 @@ pub(crate) fn for_external(this: This) -> Option<This> {
     if this.is_null() {
         return None;
     }
-    if super::host_list(this).is_some() {
+    if super::raw_host_list(this).is_some() {
         return Some(this);
     }
     let front = front(this);
