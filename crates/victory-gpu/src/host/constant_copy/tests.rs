@@ -55,26 +55,18 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         }
         a.keep(&upload);
         a.close();
-        host.execute_own(&a);
+        // Separate two valid cases: asynchronous nonoverlapping CPU
+        // updates, and an overwrite after the complete GPU flight/merge.
+        // Native queue completion alone does not finish VIctory's landing.
+        let ordered_conflict = round % 2 == 1;
+        if ordered_conflict { host.execute(&[&a]); }
+        else { host.execute_own(&a); }
         drop(upload); // the submitted list retains it
-        // The overlap case needs an actual order, not racing CPU and GPU
-        // writes with an arbitrary expected winner. Wait for the GPU write
-        // itself (without asking VIctory to settle/merge its flight), then
-        // make the CPU overwrite. The unchanged production path also failed
-        // the previous unordered fixture.
-        unsafe {
-            let completed: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            host.queue().Signal(&completed, 1).unwrap();
-            while completed.GetCompletedValue() < 1 {
-                host.device.GetDeviceRemovedReason().unwrap();
-                std::thread::yield_now();
-            }
-        }
         // The CPU changes bytes beside and after those the GPU wrote.
         unsafe {
             base.add(450).write_bytes(cpu_value, 32);
             // The CPU wins these bytes when both sides changed them.
-            base.add(160).write_bytes(conflict_value, 16);
+            if ordered_conflict { base.add(160).write_bytes(conflict_value, 16); }
         };
         assert!(b.place_copy(dst + 96, src + 32, 640));
         assert!(recent_source(dst + 112, LEN));
@@ -110,7 +102,7 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         settle_now(WHY_SYNC);
         assert!(FINISHED.load(std::sync::atomic::Ordering::Acquire) >= number);
         let expected: Vec<_> = (48..48 + LEN).map(|i| match i {
-            160..176 => conflict_value,
+            160..176 if ordered_conflict => conflict_value,
             64..364 => gpu_value,
             450..482 => cpu_value,
             _ => plain,
@@ -130,5 +122,5 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
     a.reset(); b.reset();
     assert_eq!(b.deferred().gpu_constants, 0);
     eprintln!("reference_cpu_fill={reference}");
-    eprintln!("GPU_CONSTANT_TEST 32 disjoint copies, GPU writes plus CPU changes including conflicts, exact readback, caller release and fenced resets");
+    eprintln!("GPU_CONSTANT_TEST 32 disjoint copies, GPU writes plus async CPU changes and ordered conflicts, exact readback, caller release and fenced resets");
 }
