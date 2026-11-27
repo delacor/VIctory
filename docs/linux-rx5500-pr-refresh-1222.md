@@ -17,8 +17,8 @@ to local investigation artifacts, outside this worktree.
 | --- | --- | --- |
 | Belobug #559: retain both native textures used by an alias copy | a90f7ae4b | Actual GPU resource-lifetime test passes |
 | Belobug #565: join 16-bit global loads that cross a dword boundary | fbbe96998 | Red regression reproduced; green passes 8 hardware configurations and 384 lane results |
-| Belobug #556: retain a translated shader when cache publication fails | e6321199b | Imported; qualification pending |
-| Belobug #562: clear a descriptor when a null CBV is requested | 964d66d8a | Imported; qualification pending |
+| Belobug #556: retain a translated shader when cache publication fails | e6321199b | Qualified: cache/descriptor tests, workspace check and app build pass |
+| Belobug #562: clear a descriptor when a null CBV is requested | 964d66d8a | Qualified: cache/descriptor tests, workspace check and app build pass |
 
 The first two fixes passed the Windows all-target workspace check, application
 build and 30 targeted test functions. The raw-load regression failed before
@@ -27,8 +27,13 @@ preserves half-view and native-16 metadata. Translator version 8 separates its
 cache entries from earlier version-6/7 experiments; the VSH4 format is unchanged.
 There is no independent WARP coverage or established gameplay speedup.
 
-The last two imports are source changes only while the timed comparison runs.
-Its binary remains the qualified fbbe96998 build, SHA-256
+The last two imports passed an additional 22 targeted tests: 5 shader-cache,
+10 descriptor, 6 actual GPU mesh-indirect and 1 list-factory tests. The Windows
+all-target workspace check and application build also pass. Strict Clippy was
+not run on this candidate.
+
+The completed buffer-budget comparison used the earlier fbbe96998 binary,
+SHA-256
 3305fdf99c11a7c1ba1b8bd95d41238bdfd5b5c4270d9b1d4564e4dd8a71ec78.
 Original authorship and upstream commit references are retained.
 
@@ -48,9 +53,36 @@ and dropped pipelines remain. The run ended normally with exit 143, no kernel
 messages, and at least 11.1 GiB available system RAM.
 
 Run 20261127T130904Z changes only the buffer budget to 1,536 MiB on the same
-binary. Its result is pending. These are sequential replays of a changing
-scene; unequal draw counts can confound small differences. Component timings
-overlap and must not be added together.
+binary. Its 51 warm samples average 196.46 ms/frame, effective 5.090 FPS, and
+1,120.2 draws/frame. Scenery remains visible. It exits143 normally and logs one
+AMD fence fallback timer expiration on comp_1.2.1, without an observed GPU reset.
+The 1,024 MiB profile is retained: no speedup was established.
+
+These are sequential replays of a changing scene; unequal draw counts can
+confound small differences. Component timings overlap and must not be added
+together. See [comparison](../../perf20/pr1222-buffer-budget-comparison.json).
+
+## Short mesh probe after the additional fixes
+
+Run 20261127T131957Z uses the four qualified fixes plus opt-in diagnostic
+commit 5609da821, source HEAD d95c13c50. Its binary SHA-256 is
+4339846d58c972b698036c412e2434b4dc5e003e1e4a7ddf302cbeea795a5d37.
+The probe adds CPU counters only and preserves GPU commands and full outputs.
+It returns to the original 1,024 MiB budget and ends normally after 181 world
+seconds, with scenery/character visible and an empty kernel log. Final sample:
+4.9 FPS/205.6 ms,1,095 draws,255 dropped,0 pipelines compiling. This short
+diagnostic is not a matched full-window FPS comparison.
+
+Of 2,990,080 observed mesh API recording calls, 367,138 are direct and 2,622,942
+are indirect. Every observed indirect call has exactly one maximum record;
+the 2–8,9–64 and>64 bins are zero. Application-store metadata is set on 37,070
+calls. These counts are cumulative API recordings, not active GPU draws.
+They rule out batching only within a multi-record call as a useful optimization
+for this workload. Cross-call batching still requires hazard and lifetime
+analysis; absence of buffer stores alone is insufficient.
+
+See [follow-up validation](../../perf20/pr1222-followup-validation.json) and
+[histogram](../../perf20/pr1222-mesh-histogram.json).
 
 ## Reviewed overlaps and exclusions
 
@@ -125,12 +157,13 @@ experiments, not as a live FPS measurement or GPU hardware floor.
 
 ## Next work
 
-1. Complete qualification of the cache and null-CBV imports.
-2. Finish the same-binary 1,024/1,536 MiB buffer-budget comparison.
-3. Qualify ordinary asynchronous list timestamps (7900 #453) to distinguish
+1. Qualify ordinary asynchronous list timestamps (7900 #453) to distinguish
    GPU execution from CPU copy/remap gaps without serial per-list waits.
-4. Measure mesh indirect record counts and hazards before batching compute
-   and raster work. Preserve full per-record capacity, every draw, query and
+   Isolated worktree belobug-list-stamps adapts only the timestamp portion;
+   new hardware coverage checks 1,536 stamped submissions across a full ring.
+   Its qualification is pending.
+2. Investigate hazards for batching mesh work across calls; within-call
+   batching cannot help the observed single-record workload. Preserve full per-record capacity, every draw, query and
    timestamp order, and all dependencies. Disjoint output slots may remove
    repeated compute/graphics transitions without requiring native mesh or DGC.
    Flush on any input/output hazard and retain allocations through completion.
