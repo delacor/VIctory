@@ -647,6 +647,31 @@ fn primitive_edge_flags_do_not_cull_valid_mesh_triangles() {
     }
 }
 
+/// Real mesh programs use full wave64 groups; the small three-thread
+/// fixtures alone cannot establish that their output guards and group
+/// offsets remain correct.
+#[test]
+fn wave64_mesh_compute_keeps_vertices_and_indices_in_both_groups() {
+    let host = Host::new(false).expect("a hardware SM 6.6 device");
+    for prims in [false, true] {
+        let mut native = program(prims);
+        native.wave64 = true;
+        let StageIo::Ms(ref mut mesh) = native.io else { unreachable!() };
+        mesh.threads = 128;
+        let (cs, layout) = lowered_native(true, prims, native);
+        let [vertices, indices] = run_compute(&host, &cs, &layout, 2).unwrap();
+        assert_eq!(indices, [0,1,2, 0,0,0, 0,0,0, 3,4,5, 0,0,0, 0,0,0],
+            "wave64 groups, per-primitive outputs {prims}");
+        for group in 0..2 {
+            let start = group * 3 * layout.vertex_dwords as usize;
+            for lane in 0..3 {
+                let at = start + lane * layout.vertex_dwords as usize;
+                assert_eq!(vertices[at + 3], 1.0f32.to_bits(), "position W of group {group}, vertex {lane}");
+            }
+        }
+    }
+}
+
 /// How [`render`] draws the program.
 enum Draw<'a> {
     /// As a mesh shader.
