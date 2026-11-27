@@ -3327,6 +3327,8 @@ impl State {
         if x == 0 {
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        mesh_batch_stats::note(false, 1, p.stages.iter().any(|stage| stage.translated().stores));
         let [vertices, indices, prims] = f.layout.bytes(x);
         let aligned = |n: u64| n.next_multiple_of(256);
         let (at_indices, at_prims) = (aligned(vertices), aligned(vertices) + aligned(indices));
@@ -3403,6 +3405,8 @@ impl State {
         if records == 0 {
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        mesh_batch_stats::note(true, records, p.stages.iter().any(|stage| stage.translated().stores));
         let regions = crate::mesh_indirect::regions(&f.layout);
         let draws = (u64::from(records) * u64::from(COMPUTE_STRIDE)).next_multiple_of(256);
         let commands_len = draws + u64::from(records) * u64::from(draw_stride(f.expanded));
@@ -5135,5 +5139,35 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+
+// Diagnostic counts only: no reordering, output changes or extra GPU work.
+#[cfg(feature = "diagnostics")]
+mod mesh_batch_stats {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) fn note(indirect: bool, records: u32, stores: bool) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_BATCH_STATS").is_some_and(|v| v == "1")) {
+            return;
+        }
+        // Direct, indirect single/2-8/9-64/>64, total maximum records,
+        // calls whose shader metadata reports application buffer stores.
+        static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let bin = if !indirect { 0 } else { match records { 0..=1 => 1, 2..=8 => 2, 9..=64 => 3, _ => 4 } };
+        COUNTS[bin].fetch_add(1, Relaxed);
+        COUNTS[5].fetch_add(u64::from(records), Relaxed);
+        COUNTS[6].fetch_add(u64::from(stores), Relaxed);
+        let calls = CALLS.fetch_add(1, Relaxed) + 1;
+        if calls.is_multiple_of(2048) {
+            let [direct, single, small, medium, large, maximum_records, with_stores] =
+                std::array::from_fn(|i| COUNTS[i].load(Relaxed));
+            tracing::info!(calls, direct, single, small, medium, large, maximum_records, with_stores,
+                "mesh batch probe cumulative: indirect bins count API maximum records, not active GPU records; no ordering changed");
+        }
     }
 }
