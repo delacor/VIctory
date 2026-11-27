@@ -1,5 +1,4 @@
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::Interface;
 use crate::host::ScratchPool;
 use crate::mesh_barriers::{Access, MeshBarriers};
 
