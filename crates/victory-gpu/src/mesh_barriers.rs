@@ -91,6 +91,11 @@ impl<'a> MeshBarriers<'a> {
     }
 
     #[cfg(test)]
+    pub(crate) fn enhanced_for_test(&self) -> bool {
+        self.enhanced.is_some()
+    }
+
+    #[cfg(test)]
     fn explicit(list: &'a ID3D12GraphicsCommandList, enhanced: bool) -> Self {
         Self {
             list,

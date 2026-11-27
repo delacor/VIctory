@@ -64,6 +64,7 @@ void consume(uint3 id:SV_DispatchThreadID) {
                 list.keep(&output);
                 let l = &list.list;
                 let barriers = MeshBarriers::new(l);
+                assert!(!barriers.enhanced_for_test(), "shared output must use legacy barriers");
                 barriers.begin(&region.buffer, region.first);
                 l.SetComputeRootSignature(&pr); l.SetPipelineState(&pp);
                 l.SetComputeRootUnorderedAccessView(0, address);
