@@ -14,7 +14,7 @@ d62ba28cc; it does not replace our translator or import its indirect clamp.
 Every output use ends with the existing read-to-UAV dependency. Buffers promote
 COMMON to UAV on their first access and decay after ExecuteCommandLists.
 Independently recorded lists therefore need no guessed initial transition.
-The shared mode uses legacy barriers throughout; enhanced mesh barriers are
+Shared mesh output uses legacy barriers throughout; enhanced mesh barriers are
 disabled process-wide when shared mode is selected.
 
 API rules reviewed:
@@ -33,3 +33,11 @@ private 199.526 ms (5.012 FPS, 53 samples), warm seconds 120–410.
 The changing scene and unequal draw counts limit attribution of the small
 FPS difference; the goal of 20 FPS remains unmet. See the investigation
 ledger for final/peak memory, limits, logs and the replay smoke-test issue.
+
+Publication assessment (2026-11-27): both target main branches still lack
+the compute fallback. Coordinate this result with Marvisak #961 / 7900 #20;
+#1648 already shares output globally in an alternative implementation.
+Final retained mesh storage was 1947 MiB private versus 95 MiB shared,
+about a 95% reduction. This is not limited to small-memory adapters, but
+native mesh draws bypass this scratch path. No 7900-native FPS gain is
+claimed. See the [publication assessment](../../belobug-accepted/docs/pr-drafts/linux-rx5500-pr-readiness.md).
