@@ -215,10 +215,11 @@ fn lowered_native(as_compute: bool, prims: bool, native: NativeProgram) -> (Host
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);
     validate(&s);
+    let StageIo::Ms(mesh) = &native.io else { unreachable!() };
     let layout = MeshLayout {
-        threads: 3,
-        max_vertices: 3,
-        max_primitives: 3,
+        threads: mesh.threads,
+        max_vertices: mesh.max_vertices,
+        max_primitives: mesh.max_primitives,
         vertex_dwords: 4 * outputs.len() as u32,
         primitive_dwords: 4 * prim_outputs(prims).len() as u32,
     };
@@ -651,24 +652,35 @@ fn primitive_edge_flags_do_not_cull_valid_mesh_triangles() {
 /// fixtures alone cannot establish that their output guards and group
 /// offsets remain correct.
 #[test]
-fn wave64_mesh_compute_keeps_vertices_and_indices_in_both_groups() {
+fn wave64_mesh_compute_keeps_both_halves_and_groups() {
     let host = Host::new(false).expect("a hardware SM 6.6 device");
     for prims in [false, true] {
         let mut native = program(prims);
         native.wave64 = true;
         let StageIo::Ms(ref mut mesh) = native.io else { unreachable!() };
-        mesh.threads = 128;
+        mesh.threads = 64;mesh.max_vertices = 64;mesh.max_primitives = 64;
+        let mut words: Vec<u32> = native.code.chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        // Complete the lane count in the high half of the native wave64.
+        words.splice(2..2, vop3(0x366, 0, MINUS_ONE, vgpr(0), 0));
+        native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (cs, layout) = lowered_native(true, prims, native);
         let [vertices, indices] = run_compute(&host, &cs, &layout, 2).unwrap();
-        assert_eq!(indices, [0,1,2, 0,0,0, 0,0,0, 3,4,5, 0,0,0, 0,0,0],
-            "wave64 groups, per-primitive outputs {prims}");
-        for group in 0..2 {
-            let start = group * 3 * layout.vertex_dwords as usize;
-            for lane in 0..3 {
-                let at = start + lane * layout.vertex_dwords as usize;
-                assert_eq!(vertices[at + 3], 1.0f32.to_bits(), "position W of group {group}, vertex {lane}");
+        let mut expected = Vec::new();
+        for group in 0u32..2 {
+            for lane in 0u32..64 {
+                let packed = 0x0020_0400u32.wrapping_add(lane.wrapping_mul(0x7FDF_FC00));
+                let corners = [packed & 0x1ff, (packed >> 10) & 0x1ff, (packed >> 20) & 0x1ff];
+                let culled = packed & 0x8000_0000 != 0 || corners.iter().any(|&v| v >= 64);
+                expected.extend(corners.map(|v| if culled { 0 } else { v + group * 64 }));
+                let at = (group as usize * 64 + lane as usize) * layout.vertex_dwords as usize;
+                assert_eq!(&vertices[at..at+4], &[
+                    (lane as f32 - 1.0).to_bits(), (2.0*(lane & 1) as f32-1.0).to_bits(),
+                    0.0f32.to_bits(), 1.0f32.to_bits(),
+                ], "position of group {group}, lane {lane}, per-primitive {prims}");
             }
         }
+        assert_eq!(indices, expected, "wave64 groups, per-primitive outputs {prims}");
     }
 }
 
