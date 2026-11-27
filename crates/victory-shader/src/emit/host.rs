@@ -773,6 +773,7 @@ fn fma_f16_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
         native16: true,
     })?;
     Ok(HostShader {
@@ -785,6 +786,7 @@ fn fma_f16_probe() -> Result<HostShader, crate::ShaderError> {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
