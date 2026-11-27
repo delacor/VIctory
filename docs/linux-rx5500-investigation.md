@@ -6,6 +6,12 @@ The target is sustained 20 real presentation frames per second in the same openi
 
 ## Current result and limits
 
+The latest fixed-setting replay completes its six-minute 3D window with a
+median 5.9 FPS in compilation-idle, unprofiled frame-log intervals (5.2–6.4).
+Geometry and lighting are still incomplete. Sustained 20 FPS has not been
+achieved or verified. Details, earlier controlled A/B gains and rejected
+experiments follow.
+
 The initial Series S trial reached approximately 4.6–4.9 FPS after compilation
 settled, then crashed after about five minutes. A replay with the fence/compositor
 corrections completed a six-minute 3D observation window without that exception
@@ -32,8 +38,8 @@ This is a within-run comparison; do not add gains from different runs.
 
 A previous run showed incomplete scenery. Correctness must be checked alongside
 timing: black frames, omitted draws, or missing geometry cannot count as a gain.
-Subtitles On and HUD Always have been requested but have not yet been verified
-in the saved game settings.
+A later diagnostic run visually set Subtitles to On; HUD was unchanged.
+Menu/settings interactions are excluded from scene timing windows.
 
 ## Environment and reproducibility
 
@@ -529,7 +535,7 @@ descriptor-sync tests, the signature parser, six async-lane tests, held-fence
 ownership, actual compositor pixel readback, actual off-element view refresh
 and the Wine hole-cache check. An initial lane filter selected zero tests; its
 zero exit was not counted, and the actual queue::behind tests were then run.
-Runtime qualification of this refreshed executable is still pending.
+The refreshed executable completed the controlled replay described below.
 The translator version changes from 1 to 2, invalidating old translations;
 warm-up differences must be excluded from steady-state comparisons.
 
@@ -557,3 +563,301 @@ Future runs also read only the bounded tail rather than rereading the whole
 file. This is a local test-harness fix, not an application performance PR.
 Earlier within-run A/B pairs used the same observer on both sides. Cross-run
 timings after this change cannot isolate an application-code improvement.
+
+## Refreshed fixed-setting replay and all-buffer tracking trial
+
+The refreshed executable e819e195e completed 361.4 seconds in 3D without a logged
+exception or kernel GPU fault, then the controller stopped it (143). Its 35
+compilation-idle frame-log rows from world seconds 90–280 have median 5.9 FPS
+(range 5.2–6.4), mean interval-reported frame time 169.84 ms, and 946–1277
+draws/frame. These are interval aggregates, not a per-present distribution or
+sustained-20 verification. The faster observer and translator version/cache
+change prevent an isolated cross-run upstream-merge performance claim.
+Matched captures retain the same substantial geometry and lighting gaps.
+
+A separate 30-second CPU profile began at world second 286.6, after the timing
+window. Of 37,868 samples, 16,135 map to the exact archived application binary:
+3,064 in safecopy::differ::blocks, 955 in protected copying, 863 in merging,
+854 in HostHeap::make_listed, 840 in texture::digest, and 635 in draw::bind_as.
+These are CPU samples, not wall-frame percentages.
+
+The next same-binary replay enabled only VICTORY_CARD_ALL=1, retaining all other
+settings. Twenty card-step/relay/hash tests passed beforehand. It completed
+361.0 seconds in 3D without a logged exception/reset, then stopped deliberately.
+Its corresponding 34 warm frame-log rows have median 5.3 FPS (4.7–5.9), mean
+189.15 ms, and 912–1269 draws/frame. The image remains similarly incomplete.
+CPU preparation decreased, but GPU-wait/copy-back timings increased; these
+asynchronous counters are not independent GPU timestamp measurements.
+This trial is not promoted: it shows no frame-time or visual improvement.
+CARD_ALL stays off in the following diagnostic baseline.
+
+## Opt-in mesh fallback capacity counters
+
+Code inspection found a separate omission path in mesh_indirect::SOURCE:
+when an indirect record does not fit the remaining 32-MiB output region, the
+converter sets its group count to zero. The existing native-mesh budget log
+does not account for this conversion path. This is a confirmed code behavior,
+not yet a confirmed explanation of this machine's missing scenery.
+
+VICTORY_MESH_DIAGNOSTICS=1 enables a private coherent mapped statistics buffer.
+The conversion shader atomically records active records, requested groups,
+largest record, capacity-refused records and capacity-refused groups.
+The five cumulative u32 values are asynchronous snapshots and can wrap.
+They never decide which work runs. With the switch off, the additional UAV
+branch does not access the statistics buffer and no such buffer is allocated.
+
+All five mesh-indirect tests pass on the RX 5500 XT. The new actual-GPU
+readback regression independently checks an over-capacity record, a zero-group
+record and count-excluded records. It compares every generated command with
+measurement off and on, and checks the numeric counters. Optimized test and
+application builds pass. Scene measurements with these counters remain pending.
+
+## Next experiments and acceptance targets
+
+- Use the mesh counters to accept or reject the output-capacity hypothesis;
+  fix dropped valid geometry before treating a fast incomplete image as success.
+- Test renderer guard/journal changes with their own nonzero regressions and
+  matched runtime A/B phases. Keep settings that alter shader translation in
+  separate cache identities.
+- Consider GPU-written-page instrumentation from upstream cd94d3538 and
+  940d32f69 to avoid full CPU buffer scans. The fork's asynchronous flights
+  require explicit bitmap lifetime, visibility and clearing rules; a direct
+  source merge alone is insufficient validation.
+- Investigate fence-aware reuse of mesh buffers on list destruction if allocation
+  remains material. Preserve in-flight ownership, state transitions and a bound
+  on retained bytes; reducing a heuristic delay without proof is unacceptable.
+- Preserve direct HID DS4 and the private Wine memory fixes. Exclude menu
+  transitions from timing; a 30-FPS pause panel is not a 3D performance result.
+- Final target remains sustained 20 actual FPS in the same complete opening
+  scene, with cold/warm context, frame-time distribution, memory guard and kernel
+  logs recorded. No result so far satisfies it.
+
+## Capacity hypothesis rejected for the observed scene
+
+In the 93d852ee8 diagnostic replay, the last cumulative counter snapshot before
+the menu phase reports 1,960,552 active records, 13,713,940 requested groups,
+largest record 564 groups, and zero capacity-refused records or groups.
+Twenty-seven snapshots precede menu interaction. This rejects the output-cap
+hypothesis for that observed interval; increasing the 32-MiB cap is not justified
+as a scenery fix. It does not establish correctness of generated vertices,
+shader resource bindings or pixel interpolation.
+
+The complete diagnostic process later stopped at the configured observation
+limit (143). Its later menu/settings phase is not a scene FPS benchmark.
+
+The direct cherry-pick assessment of upstream written-page tracking found
+conflicts in all twenty touched paths and incompatible shader interfaces:
+the fork uses root_indexed_views, reserved root slots and different mesh/wave
+entry points; upstream expects its Options API and MEMORY_SPACE metadata.
+No side was blindly selected and no merged version was built. The attempt
+was undone only in its fresh isolated worktree. A future adaptation needs
+an explicit asynchronous-flight and shader-binding design.
+
+The existing memory-watch and sharded-journal suites pass 52 and two tests.
+A same-binary runtime A/B of VICTORY_PORT_GUARD and VICTORY_PORT_JOURNAL is
+running separately, with capacity diagnostics disabled. No gain is claimed
+until matched warm phases complete.
+
+
+## Later overnight comparisons (2026-11-27 UTC)
+
+All runs below retained the same Series S, 1920x1080 launch profile, private
+Wine server and opt-in barycentric backend, view pooling and smaller first mesh
+chunks. The controller stopped each after approximately 361 seconds in 3D
+(exit 143); none logged an application exception or kernel GPU fault/reset.
+The images still lack the character's body and most scenery, with a flat orange
+environment and a checkerboard panel. These are incomplete-rendering results.
+
+| Run | Experiment | Result |
+| --- | --- | --- |
+| 000823 | Refreshed Belobug e819e195e | 35 warm log rows, median 5.9 FPS, mean 169.84 ms; separate later CPU sampling excluded |
+| 001611 | Same executable, CARD_ALL=1 | 34 warm rows, median 5.3 FPS, mean 189.15 ms; unchanged incomplete image; not promoted |
+| 002727 | Mesh output-capacity diagnostic | 1,960,552 records / 13,713,940 groups before menu work, maximum 564 groups per record, zero capacity refusals |
+| 004233 | Guard-fault merge and write-watch journal 2x2 A/B | All four warm states 5.51–5.58 FPS; no material benefit; both remain off |
+| 010017 | Retire destroyed-list mesh chunks into free pool, A/B | Four matched warm pairs: 179.358 ms off versus 179.050 ms on (5.575 versus 5.585 FPS); no material benefit; remains off |
+| 012017 | Bounded compute-pipeline waits, fixed on | 35 warm rows, median 5.7 FPS, mean 174.91 ms; missing body/scenery unchanged; not promoted |
+
+The fixed-run warm interval is 90–280 seconds after first 3D. Cross-run frame
+means are descriptive, not isolated causal comparisons. The timed A/B runs use
+the same process and exclude each phase's first second; allocator state survives
+between phases. No compilation or sampling profiler ran during timed intervals.
+
+### Capacity and mesh-pool findings
+
+The opt-in mesh capacity diagnostic 93d852ee8 counts generated and refused
+records/groups without changing the generated commands. Its actual GPU test
+forces a refusal and verifies exact commands both with and without diagnostics.
+All five indirect-mesh tests pass. The real replay had zero refusals, so raising
+the 32-MiB output cap is not justified as a fix for this missing scenery.
+
+Experimental 6f38f270f keeps destroyed-list mesh chunks only after the existing
+queued/started/finished retirement and bury lag, with a separate 128-MiB pending
+cap and no other COM owner. The GPU regression uses a private identity marker
+to establish actual reuse, verifies readback, waits the retirement lag and
+excludes externally owned chunks. Three prior mesh tests and the new regression
+pass; the regression fails before the change. The live run reached 112 MiB
+pending, admitted 3,247 chunks and returned 2,777, but its FPS gain is within
+noise. Keep this local experiment off; real reuse alone is not a performance
+claim.
+
+### Shader-wait selection and validation
+
+The isolated compute-wait branch imports Beqren's f63017aaf from
+[7900XTX #166](https://github.com/avatarmanz/VIctory-7900XTX/pull/166),
+as 3ee19eb89. It prioritizes queued compute requests and bounds time spent
+waiting, while preserving this fork's compiler-crash quarantine. The conflicting
+fxceless alternative assumes OnceLock serializes construction; it was not
+combined with this fork's deliberately nonblocking crash guard.
+
+The workspace/all-target check passes. Initially, ten combined test assertions
+passed but the Wine process exited 137 during lazy graphics teardown; isolated
+tests and the seven-test baseline exited cleanly, with no OOM or GPU fault.
+The worker published pipeline readiness before its cache-save cleanup finished.
+Test-only commit c7249cdbc waits for that cleanup before test DLL teardown;
+the combined ten tests and the Wine compatibility test then exit zero. The
+optimized application build passes. The initial abnormal test exit remains
+archived; it is not counted as a clean pass.
+
+The known head-map shader 61e54e90adccaf6a was already compiled about 70 seconds
+before its first bind in the baseline, so the PR's reported symptom is not
+evidence that that shader was missed here. The six-minute replay did not restore
+the body or scenery. Do not carry this scheduling change into the current
+performance candidate solely on its PR title.
+
+### Next isolated experiment: per-root UAV writes
+
+[Marvisak #2948](https://github.com/Marvisak/VIctory/pull/2948)
+contains 95110f370 and its correctness follow-up 9f392adc0. The first records
+which root UAVs a shader may actually write instead of snapshotting/comparing
+all bound roots; the follow-up preserves stores reached through root addresses,
+which do not use a root handle. This is relevant to the measured copyback
+comparison cost, but benefit is not established yet.
+
+The local port starts from the refreshed Belobug candidate and preserves its
+bounded root tables, root-indexed views, compute-mesh entry points and generic
+address-write fallback. Shader-cache format VSH3 forces old entries to be
+translated again with write metadata. The experimental filter defaults off and
+has a diagnostic A/B switch; heap UAVs retain existing conservative handling.
+Local commit 036278a8f passes the optimized Windows workspace/all-target
+check, three direct/spilled/handle write-tracking tests (including DXIL
+validation), three cache tests including explicit VSH2 rejection, and the
+application build. The guarded live A/B (013347) completed 361.3 seconds in 3D without a
+logged exception or kernel GPU fault, then stopped deliberately. Four matched
+warm pairs (6/7, 8/9, 10/11, 12/13), each with draw counts within 5%, contain
+681 frames per side: 170.715 ms off versus 170.792 ms on (5.858 versus
+5.855 FPS). The image is unchanged. No benefit is established; the filter stays
+off. The remaining comparison cost is predominantly outside these root bindings. Neither upstream's distinct page-table implementation nor its
+overlapping-copy follow-up (#1963) has been blindly merged into this fork.
+
+
+## Imported-memory gate and next profile
+
+The mapper-side follow-up
+[jtrudeau1530 #25](https://github.com/jtrudeau1530/VIctory-7900XTX/pull/25)
+was fetched explicitly from the discussion link. Isolated branch
+perf20/import-gate-20261127 imports b54eb8d49, 34c409656 and c2cdabb12 as
+033fcf8be, 81ad609ec and e95859d47. It checks an actual nonzero GPU readback
+from a private section before opening title regions; the mapper asks the same
+gate before rearranging pages. Port 1 remains off in the current game profile.
+This is a compatibility safeguard, not an FPS improvement.
+
+The explicit physical-adapter regression ran on RX 5500 XT/RADV 25.3.6 and passed:
+section-backed imports were rejected before opening title memory. This test
+establishes that the path is unavailable here, not yet the precise API failure
+or fallback contents. The optimized Windows workspace/all-target check and
+three cache tests also pass. Commit 33090010b advances both cache namespace
+FORMAT and entry encoding to 3; mixed old/new executables do not overwrite
+each other's entries.
+
+The next separate diagnostic uses the loader's Windows-aware stack sampler and
+the existing in-place probe. It does not serve as an FPS benchmark. The normal
+warm run still compares around 232 MB/frame after shader execution, including
+about 43 ms of snapshots and 25–27 ms guarding in the periodic counters. Those
+timings overlap threads and phases and must not be added as an end-to-end frame
+breakdown. Root-only elision does not materially affect them. The diagnostic
+should distinguish heap-buffer copyback, mapping, guarded landing and profiling
+instrumentation before a further optimization is selected.
+
+
+## Diagnostic failure and observer stack reservation
+
+The full existing in-place probe in run 014338 caused a D3D device removal
+(0x887A0005 / Vulkan -4) before the first world frame, exit 5. The kernel log
+contains no reset/fault. Its private-memory copy reads/writes initially succeeded,
+but its shader phase was refused and later operations failed; that is not a
+valid proof of programmable imported-memory support. Section reads/writes did
+not alias the CPU view. The full probe is disabled and will not be repeated in
+the game. The smaller independent section-import rejection test remains valid.
+
+The first stack-only retry 014603 failed its 185-MiB low graphics-heap allocation
+at startup, then entered the game's breakpoint and Wine's debugger. It produced
+no usable profile and was stopped by its own service. The controller now detects
+explicit unhandled exceptions, host GPU failures and WineDbg attachment and stops
+only its selected game process; normal handled first-chance guard faults do not
+trigger this check. The saved memory map shows many 128-MiB anonymous stack
+reservations in the low 4-GiB address space, with the executable near its top.
+
+The runtime keeps RUST_MIN_STACK=134217728 for translator depth. The profiler's
+otherwise idle std::thread::spawn also inherits that setting. Local f918f1381
+uses an explicit named 4-MiB observer and reports a spawn error. A native
+regression measures the actual reserved allocation, not just the committed
+stack: 134,217,728 bytes before (fails the bound), 4,194,304 after (passes),
+under the same global setting. All seven profiling tests and 24 crash/unwind
+tests pass, as do the optimized Windows workspace/all-target check and build.
+
+The regression's first harness placement in a subdirectory missed adjacent
+runtime DLLs (exit 53, no test ran); rerunning beside those DLLs with the original
+Cargo executable basename produced the actual before-fix failing assertion.
+No empty-output or zero-test run is counted as evidence.
+
+A replay with the bounded observer, full import probe off and an explicit
+210–240-second sampling window began at 01:53:26 UTC (015326). The graphics-heap allocation now succeeds and the replay reaches 3D; its
+30-second capture completes (582 rounds / 16,296 sampled stacks), followed by
+the controller stopping at 301.4 seconds in 3D. No application exception or
+kernel fault/reset was logged. This supports the startup-reservation fix;
+profiling perturbs timing and establishes no FPS improvement.
+
+## Accepted candidate versus experiments
+
+Branch perf20/accepted-20261127 starts from the refreshed Belobug merge and
+retains the measured view-pool and smaller-mesh-chunk gains, DS4 and prior memory,
+mesh-index and fence fixes. It adds the import-gate commits as f8d8d75e9,
+ca8f95d77, 9fe206f3a and the observer-stack fix as 2432cfb83.
+
+The default-off root-write metadata trial, destroyed-list mesh pool and bounded
+compute waits remain separately preserved experiments, not promoted performance
+fixes. Removing the root metadata trial also avoids carrying its cache-format
+change into that clean branch. This branch still needs its own final build and
+runtime comparison before replacing a tested executable.
+
+
+## Windows-aware profile: snapshot copy target
+
+The exact executable and profile for 015326 were archived together. LLVM
+resolved 1,519 distinct application RVAs. Of 16,296 sampled stacks, 13,498
+start in ntdll, 1,314 in our executable, 619 in ucrtbase and 463 in the title.
+These are stack observations including blocked threads, not percentages of
+CPU time. Per-thread CPU counters separately show the submitter and four
+wide-copy workers among the busiest.
+
+Of the 619 ucrtbase-top stacks, 560 return first to copy_jobs' snapshot copy
+(shadow.rs:1656 in that build). The exact local DLL resolves those addresses
+to sse2_memmove; disassembly shows four 16-byte loads and stores per 64-byte
+iteration. An initial scalar-loop description was incorrect. Separate active
+application samples include 277 in the AVX2 compare loop, 111 in protected
+copying and 82 in protected merging. The snapshot read/write path is a useful
+target without changing which bytes are snapshotted or merged.
+
+The next isolated branch perf20/snapshot-copy-20261127 starts from the clean
+candidate, not the rejected root-write trial. It adds a default-off AVX2 copy
+for valid, held host-buffer mappings into snapshots, with a CPU feature check
+and standard fallback. The loop covers complete 32-byte blocks and copies
+only the byte tail; it never rounds beyond either range. Unaligned/canary and
+guard-page regressions plus a mapped-host-buffer-to-private-snapshot benchmark
+are being run before a live off/on comparison. No benefit is claimed yet.
+
+The cached-native pipeline slots were also reviewed against later fork evidence
+(ffe09a4e7, 58de9bf4c): the title falls back from those methods to ordinary
+pipeline descriptions. Their thousands of failed native-cache requests alone
+are not proof that thousands of rendered pipelines are missing. The ACCC/FSPX
+deserializer proposal is not imported as a speculative scenery fix.

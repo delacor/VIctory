@@ -135,3 +135,46 @@ The separate Belobug refresh preserves DS4 and imports newer diagnostics,
 descriptor synchronization and crash checks. It is not the same executable as
 the measured allocation A/B; its complete validation status belongs in the
 investigation ledger before submission.
+
+## Diagnostic follow-up, separate from performance fixes
+
+The opt-in indirect-mesh counters expose capacity-refused records that the
+native mesh-budget log does not count. Five GPU conversion tests pass, including
+a new numeric counter readback and byte-for-byte generated-command comparison
+with measurement off/on. The pre-menu scene interval reports 1.96 million records and 13.71 million
+requested groups with zero capacity refusals. The output cap is not the
+observed missing-scenery cause in that interval.
+Do not claim this diagnostic itself repairs geometry or improves FPS.
+
+The refreshed fixed-setting replay now completes at a median 5.9 FPS in warm
+frame-log intervals. The CARD_ALL experiment completes at 5.3 FPS and is not
+promoted. Both retain incomplete rendering; see the investigation for controls
+and limitations.
+
+
+## Overnight qualification
+
+The later controlled tests found no material FPS improvement from guard/journal
+tracking or destroyed-list mesh reuse; those experiments remain off. Bounded
+compute waits also left the missing body/scenery unchanged in a six-minute
+replay. None should be presented as a demonstrated performance fix. The report
+records their tests, attribution and limits.
+
+Per-root UAV write tracking from Marvisak #2948 is the next isolated experiment,
+including its root-address correctness follow-up. It must be reviewed against
+that existing PR rather than submitted as duplicate new work. Menu changes are
+no longer requested or part of the testing procedure.
+
+
+Per-root write elision also measured flat in four matched warm pairs (5.858 FPS
+off, 5.855 on), with unchanged incomplete scenery; keep it as a local experiment.
+The new imported-memory mapper gate has an actual RX 5500 XT negative-capability
+test: unsupported section imports are rejected before title memory is rearranged.
+That existing fork PR should receive any follow-up rather than a duplicate
+performance submission.
+
+
+A separate diagnostic reliability change gives the scheduled observer an explicit
+4-MiB stack instead of inheriting the translator's 128-MiB global setting. Its
+native before/after reservation regression and related loader tests pass. See
+[the separate profiler draft](linux-profiler-stack.md); it makes no FPS claim.

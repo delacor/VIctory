@@ -74,3 +74,31 @@ The later independent mesh-size A/B measured 4.75 to 5.62 FPS at similar draw
 counts, with view pooling fixed on. This still does not verify sustained 20 FPS.
 The refreshed Belobug merge is separately qualified; do not attribute the
 measured gains to every new fork change.
+
+
+## Overnight qualification
+
+The later controlled tests found no material FPS improvement from guard/journal
+tracking or destroyed-list mesh reuse; those experiments remain off. Bounded
+compute waits also left the missing body/scenery unchanged in a six-minute
+replay. None should be presented as a demonstrated performance fix. The report
+records their tests, attribution and limits.
+
+Per-root UAV write tracking from Marvisak #2948 is the next isolated experiment,
+including its root-address correctness follow-up. It must be reviewed against
+that existing PR rather than submitted as duplicate new work. Menu changes are
+no longer requested or part of the testing procedure.
+
+
+Per-root write elision also measured flat in four matched warm pairs (5.858 FPS
+off, 5.855 on), with unchanged incomplete scenery; keep it as a local experiment.
+The new imported-memory mapper gate has an actual RX 5500 XT negative-capability
+test: unsupported section imports are rejected before title memory is rearranged.
+That existing fork PR should receive any follow-up rather than a duplicate
+performance submission.
+
+
+A separate diagnostic reliability change gives the scheduled observer an explicit
+4-MiB stack instead of inheriting the translator's 128-MiB global setting. Its
+native before/after reservation regression and related loader tests pass. See
+[the separate profiler draft](linux-profiler-stack.md); it makes no FPS claim.
