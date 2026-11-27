@@ -964,3 +964,54 @@ Further triage:
   and warm-up changes. It needs separation/review and is not yet accepted.
 - #443's cache-lock creation changes overlap our existing prune/pool work and
   require an adaptation that preserves placed-resource ownership.
+
+## Relay replay, safe target capture and opaque-scene diagnosis (03:20 UTC)
+
+Relay import 6b6bbf122 completed run 030034: 360.8 seconds in 3D, no explicit
+unhandled exception or host GPU failure. The queue counters exercise both
+paths (e.g. 3.5 copy-queue fetches, 3.3 drawing-queue fetches and 0.2 waits per
+frame in the final line). It is retained as accepted 1173d5d8a for ordering
+correctness. The body/scenery still disappear. CAPTURE_WORLD saves recurring
+frames, so the 177.45-ms warm median is not an isolated performance comparison.
+
+DexNom #127's bounded readback mapping is selectively ported as e477145d9.
+A D3D12 footprint can omit the final row padding; capture maps the resource's
+actual byte width and unmaps via a guard. All four capture checks, including an
+actual GPU 268-byte/two-row readback, pass. The Windows workspace/all-target
+check and optimized application build pass too. Deferred-input capture code is
+absent from this fork and was not imported.
+
+Run 031059 captures the targets of frame 2200 and completes its 241-second
+3D window. The same-frame color/material G-buffers contain the room, window
+framing, floor and outdoor scenery that the final presented image loses.
+This is evidence to examine depth, lighting and composition, rather than assume
+that every missing object was never drawn. The capture also shows populated
+depth/stencil data. R32G32_UINT (17) and R32G32B32A32_UINT (3) targets currently
+lack a diagnostic PNG decoder; a missing dump for them is not an empty target.
+No native title assets, targets or operation dumps belong in a source PR.
+
+The ambient stand-in is actually compiled/running in the logs (Radiance and
+Resolve); no Wine compiler failure occurs there. The current launch profile
+sets AMBIENT=0.8 but leaves AMBIENT_AIR unset, which is zero/off. The existing
+ambient module and fork-ray-tracing.md document that this leaves a brown veil
+in the day room without rays. Run 031926 tests the existing air correction at
+0.25 with exactly the same executable and pixels. It is a diagnostic of the
+disabled ray-tracing fallback, not a new renderer fix or native-lighting claim.
+
+The prepared cache-lock adaptation cf18cdb00 preserves the placed-resource
+pool and bounded eight-miss pruning. Atomic last-use stamps use fetch_max.
+The concurrent-miss test 97dd7454d checks a single canonical Arc and actual GPU
+bytes after losing allocations are dropped. Follow-up d8b2c557c keeps imported
+window creation/publication under the same exclusion lock as in_place_let_go;
+only ordinary copied-window allocation moves outside it. This prevents a remap
+from removing an entry just before an unlocked creator republishes its old
+imported mapping. These changes are not yet compiled or benchmarked.
+
+The combined experimental branch perf20/copy-performance-20261127 contains
+the candidate budget pool, range algorithms and cache-lock adaptation on the
+accepted correctness base, with the capture and test-compiler fixes. Pool and
+range gates remain off by default. Its new combination has not been qualified
+and must not replace the accepted/runtime build yet. The range comparison
+also restores the true original empty-range scan on its off side: the imported
+pairwise helper already had an early exit, which otherwise silently improves
+both sides and hides part of the PR's gain.

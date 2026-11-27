@@ -117,3 +117,11 @@ FPS claim. The newer relay ordering PR Belobug #428 is next: both numerical GPU
 ordering regressions pass with the old repair checker off, but its game replay
 is still pending. Coordinate follow-ups with those existing PRs and preserve
 their authorship; these are attributed imports, not new submissions of our own.
+
+The relay ordering correction is retained after its GPU checks and six-minute
+replay; it did not restore the missing opaque scenery. A bounded diagnostic
+readback fix from DexNom #127 also passes its actual GPU last-row test and a
+single-frame target dump. That dump shows room/scenery in the G-buffers that
+the final image loses, so the current visual investigation targets lighting,
+depth and composition. No source PR should include the private target images,
+native shaders, operation logs or executable.
