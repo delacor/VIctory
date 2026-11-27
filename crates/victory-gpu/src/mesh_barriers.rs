@@ -460,18 +460,13 @@ cbuffer C:register(b0) {uint tag;}
                 Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
                 ..Default::default()
             }];
-            let signature: ID3D12CommandSignature = host
-                .device
-                .CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 12,
-                        NumArgumentDescs: 1,
-                        pArgumentDescs: desc.as_ptr(),
-                        NodeMask: 0,
-                    },
-                    None::<&ID3D12RootSignature>,
-                )
-                .unwrap();
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            host.device.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: desc.as_ptr(), NodeMask: 0,
+                }, None::<&ID3D12RootSignature>, &mut signature,
+            ).unwrap();
+            let signature = signature.unwrap();
             for enhanced in [false, true] {
                 let args = host.uav_buffer(256).unwrap();
                 let outputs: Vec<_> = (0..32).map(|_| host.shared_buffer(64).unwrap()).collect();
