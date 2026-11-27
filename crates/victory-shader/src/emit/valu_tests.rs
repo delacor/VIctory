@@ -105,6 +105,17 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_with(body, threads, lds_bytes, false)
+}
+
+/// [`build_valu_cs`] lowered for a host with native 16-bit float operations
+/// (`lower::Parts::native16`).
+fn build_native_cs(body: &[u32]) -> HostShader {
+    build_cs_with(body, 1, 0, true)
+}
+
+/// [`build_cs`]; `native16`: f16 arithmetic in native `half`.
+fn build_cs_with(body: &[u32], threads: u32, lds_bytes: u32, native16: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -174,6 +185,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         mesh_as_compute: false,
+        native16,
     })
     .expect("lower");
 
@@ -2094,6 +2106,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })
     .expect("lower");
 
@@ -2735,4 +2748,268 @@ fn a_format_load_read_as_halves_loads_the_integer() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// Runs `shader` (lowered with native 16-bit float operations) as
+/// [`run_cases`] does, on the hardware adapter alone and only where it
+/// passes `Host::native16` (WARP rounds a 16-bit `FMad` twice and is never
+/// given native `half`): elsewhere nothing runs.
+fn run_native_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    let native = {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        Host::new(false).map(|h| (h.adapter_name(), h.native16()))
+    };
+    match native {
+        Ok((_, true)) => run_cases_on(shader, cases, &[("hardware", false)], check),
+        Ok((name, false)) => eprintln!("{name:?}: no native 16-bit float operations; skipped"),
+        Err(e) => eprintln!("no SM 6.6 hardware device ({e}); skipped"),
+    }
+}
+
+/// A finite f16's sign and magnitude in units of 2^-24 (every f16 is a
+/// whole number of them).
+fn f16_exact(bits: u16) -> (bool, u128) {
+    let (e, m) = (u32::from(bits >> 10 & 0x1F), u128::from(bits & 0x3FF));
+    assert!(e != 0x1F, "{bits:#06x} is not finite");
+    (bits & 0x8000 != 0, if e == 0 { m } else { (m | 0x400) << (e - 1) })
+}
+
+/// The f16 nearest (ties to even) to `±mag × 2^-48`, overflowing to an
+/// infinity; a zero `mag` gives the zero of that sign.
+fn f16_round(neg: bool, mag: u128) -> u16 {
+    let sign = if neg { 0x8000 } else { 0 };
+    if mag == 0 {
+        return sign;
+    }
+    // 11 significant bits, and no finer than the denormals' 2^-24.
+    let msb = 127 - mag.leading_zeros();
+    let shift = msb.saturating_sub(10).max(24);
+    let mut q = mag >> shift;
+    let rem = mag & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    if rem > half || rem == half && q & 1 != 0 {
+        q += 1;
+    }
+    let bits = ((u128::from(shift) - 23) << 10) + q - 1024;
+    sign | bits.min(0x7C00) as u16
+}
+
+/// The console's f16 `a × b + c`, rounded once to nearest even.
+fn f16_fma_model(a: u16, b: u16, c: u16) -> u16 {
+    let ((sa, ma), (sb, mb), (sc, mc)) = (f16_exact(a), f16_exact(b), f16_exact(c));
+    let (sp, mp) = (sa != sb, ma * mb);
+    let mc = mc << 24;
+    let signed = |neg: bool, m: u128| if neg { -(m as i128) } else { m as i128 };
+    let sum = signed(sp, mp) + signed(sc, mc);
+    if sum == 0 {
+        // An exact zero: -0 only from two zeros that are both -0.
+        return f16_round(mp == 0 && mc == 0 && sp && sc, 0);
+    }
+    f16_round(sum < 0, sum.unsigned_abs())
+}
+
+/// The console's f16 `a × b`, rounded once to nearest even.
+fn f16_mul_model(a: u16, b: u16) -> u16 {
+    let ((sa, ma), (sb, mb)) = (f16_exact(a), f16_exact(b));
+    f16_round(sa != sb, ma * mb)
+}
+
+/// Finite f16 bit patterns, denormals included, half of them near 1.0
+/// where the rounding of sums and products is seen most.
+fn f16_samples(n: usize, seed: u64) -> Vec<u16> {
+    let mut x = seed;
+    let mut out = Vec::new();
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let bits = if x >> 40 & 1 != 0 {
+            (0x3400 + (x >> 16) as u16 % 0x1000) | ((x >> 48) as u16 & 0x8000)
+        } else {
+            (x >> 16) as u16
+        };
+        if bits & 0x7C00 != 0x7C00 {
+            out.push(bits);
+        }
+    }
+    out
+}
+
+/// VOP3P `op vdst, src0, src1, src2` (op_sel 0, op_sel_hi 1: each half
+/// reads its own half).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0xCC00_0000 | (op as u32 & 0x7F) << 16 | 0x4000 | vdst as u32,
+        0x1800_0000 | (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// Native `half` arithmetic (port of Marvisak/VIctory#2825) against the
+/// console's: sums, differences, products and fused multiply-adds rounded
+/// once to nearest even, scalar and packed, on random finite inputs
+/// (denormals included) and Marvisak/VIctory#2384's three FMA cases.
+#[test]
+fn native_f16_arithmetic_rounds_once_to_nearest_even() {
+    type Model = fn(u16, u16, u16) -> u16;
+    const ONE: u16 = 0x3C00;
+    let ops: [(&str, Vec<u32>, Model); 6] = [
+        ("v_add_f16", vop3(0x132, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(), |a, b, _| f16_fma_model(a, ONE, b)),
+        ("v_sub_f16", vop3(0x133, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(), |a, b, _| {
+            f16_fma_model(a, ONE, b ^ 0x8000)
+        }),
+        ("v_subrev_f16", vop3(0x134, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(), |a, b, _| {
+            f16_fma_model(b, ONE, a ^ 0x8000)
+        }),
+        ("v_mul_f16", vop3(0x135, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(), |a, b, _| f16_mul_model(a, b)),
+        ("v_fma_f16", vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(), f16_fma_model),
+        // v_mov_b32 v0, v3; v_fmac_f16 v0, v1, v2
+        ("v_fmac_f16", vec![vop1(0x001, 0, vgpr(3)), 0x6C00_0501], f16_fma_model),
+    ];
+    let samples = f16_samples(3 * 48, 0x2825);
+    let mut triples: Vec<[u16; 3]> = samples.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+    triples.extend([[0x3C01, 0x3E00, 0x8001], [0x3C03, 0x3E00, 0x0001], [0x3C01, 0x3E00, 0xBE00]]);
+    let cases: Vec<[u32; 4]> =
+        triples.iter().map(|t| [u32::from(t[0]), u32::from(t[1]), u32::from(t[2]), 0]).collect();
+    for (name, body, model) in &ops {
+        let shader = build_native_cs(body);
+        run_native_cases(&shader, &cases, |backend, i, _, got| {
+            let [a, b, c] = triples[i];
+            let want = model(a, b, c);
+            assert_eq!(got as u16, want, "{backend}: {name}({a:#06x}, {b:#06x}, {c:#06x})");
+        });
+    }
+    // Packed: each half on its own.
+    let packed: [(&str, u16, Model); 3] = [
+        ("v_pk_add_f16", 0x0F, |a, b, _| f16_fma_model(a, ONE, b)),
+        ("v_pk_mul_f16", 0x10, |a, b, _| f16_mul_model(a, b)),
+        ("v_pk_fma_f16", 0x0E, f16_fma_model),
+    ];
+    let pairs: Vec<[u32; 4]> = triples
+        .chunks_exact(2)
+        .map(|p| {
+            let pack = |k: usize| u32::from(p[0][k]) | u32::from(p[1][k]) << 16;
+            [pack(0), pack(1), pack(2), 0]
+        })
+        .collect();
+    for (name, op, model) in packed {
+        let shader = build_native_cs(&vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_native_cases(&shader, &pairs, |backend, _, inp, got| {
+            for half in [0, 16] {
+                let [a, b, c] = [inp[0], inp[1], inp[2]].map(|x| (x >> half) as u16);
+                let want = model(a, b, c);
+                let got = (got >> half) as u16;
+                assert_eq!(got, want, "{backend}: {name}({a:#06x}, {b:#06x}, {c:#06x}), half {half}");
+            }
+        });
+    }
+}
+
+/// The exact native operations give what the console does: of two zeros
+/// max takes +0 and min -0, med3 with a NaN gives the least of the others,
+/// and the clamp makes -0 and NaN +0.
+#[test]
+fn native_f16_zeros_nans_and_clamp_are_the_consoles() {
+    let (pz, nz) = (0_u32, 0x8000_u32);
+    let zeros = [[nz, pz, nz, 0], [pz, nz, nz, 0], [nz, pz, pz, 0], [pz, nz, pz, 0]];
+    // On an RDNA adapter also as written for one (`rdna::MAX_MIN`: the host's
+    // own maximum and minimum, which order the zeros there).
+    let rdna = {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        Host::new(false).ok().and_then(|h| h.translation_caps()).is_some_and(|(_, rdna)| rdna)
+    };
+    let forms: &[u32] = if rdna { &[0, super::rdna::ALL] } else { &[0] };
+    let (h0, h1, h2, h3, h5, hn2, nan) = (0u32, 0x3C00, 0x4000, 0x4200, 0x4500, 0xC000, 0x7E00);
+    let med3: &[([u32; 4], Option<u16>)] = &[
+        ([h1, h2, h3, 0], Some(h2 as u16)),
+        ([hn2, h0, h3, 0], Some(h0 as u16)),
+        ([h1, h2, nan, 0], Some(h1 as u16)),
+        ([nan, h1, h0, 0], Some(h0 as u16)),
+        ([h2, nan, h1, 0], Some(h1 as u16)),
+        ([nan, h5, nan, 0], Some(h5 as u16)),
+        ([nan, nan, nan, 0], None),
+        ([nz, pz, nz, 0], Some(nz as u16)),
+        ([pz, nz, pz, 0], Some(pz as u16)),
+    ];
+    for &bits in forms {
+        lower::TEST_RDNA.set(Some(bits));
+        let built: Vec<(&str, HostShader, u32)> = [
+            ("v_max_f16", 0x139, pz),
+            ("v_min_f16", 0x13A, nz),
+            ("v_max3_f16", 0x354, pz),
+            ("v_min3_f16", 0x351, nz),
+        ]
+        .into_iter()
+        .map(|(name, op, want)| (name, build_native_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3))), want))
+        .collect();
+        let median = build_native_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
+        lower::TEST_RDNA.set(None);
+        for (name, shader, want) in &built {
+            run_native_cases(shader, &zeros, |backend, _, inp, got| {
+                assert_eq!(got & 0xFFFF, *want, "{backend}, rdna {bits}: {name} {inp:x?}");
+            });
+        }
+        let inputs: Vec<[u32; 4]> = med3.iter().map(|c| c.0).collect();
+        run_native_cases(&median, &inputs, |backend, i, inp, got| match med3[i].1 {
+            Some(want) => assert_eq!(got as u16, want, "{backend}, rdna {bits}: v_med3_f16 {inp:x?}"),
+            None => assert!(is_f16_nan(got as u16), "{backend}: v_med3_f16 of NaNs = {got:#x}"),
+        });
+    }
+    // v_add_f16 v0, v1, v2 clamp
+    let shader = build_native_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0, 0, true));
+    let clamp: &[([u32; 4], u16)] = &[
+        ([nz, nz, 0, 0], 0),
+        ([nan, h1, 0, 0], 0),
+        ([0xFE00, h1, 0, 0], 0),
+        ([h1, h1, 0, 0], 0x3C00),
+        ([0x3800, 0, 0, 0], 0x3800),
+        ([hn2, h1, 0, 0], 0),
+    ];
+    let inputs: Vec<[u32; 4]> = clamp.iter().map(|c| c.0).collect();
+    run_native_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(got as u16, clamp[i].1, "{backend}: v_add_f16 clamp {inp:x?}");
+    });
+}
+
+/// The SFI0 native 16-bit bit (and the 16-bit data layout, which the
+/// validator checks when it is there) exactly where native `half`
+/// arithmetic is: not for the f32 path, nor for a conversion, which stays
+/// on it.
+#[test]
+fn native_16bit_operations_are_declared_where_used() {
+    let declared = |shader: &HostShader| {
+        let c = crate::dxbc::Container::parse(&shader.dxil).expect("a container");
+        let sfi0 = c
+            .part(crate::dxbc::FourCC::SFI0)
+            .map_or(0, |p| crate::dxbc::u32_at(p.data, 0).unwrap_or(0));
+        sfi0 & 0x4_0000 != 0
+    };
+    let add = vop3(0x132, 0, vgpr(1), vgpr(2), vgpr(3));
+    assert!(declared(&build_native_cs(&add)), "native v_add_f16");
+    assert!(declared(&build_native_cs(&vop3p(0x0E, 0, vgpr(1), vgpr(2), vgpr(3)))), "native v_pk_fma_f16");
+    assert!(!declared(&build_valu_cs(&add)), "v_add_f16 in f32");
+    // v_cvt_f16_f32 v0, v1 (VOP1 0x00a)
+    assert!(!declared(&build_native_cs(&[vop1(0x00A, 0, vgpr(1))])), "v_cvt_f16_f32");
+}
+
+/// WARP has native 16-bit operations but rounds a 16-bit `FMad` in f32
+/// first, so it keeps the f32 path.
+#[test]
+fn hosts_that_round_f16_fmad_twice_keep_the_f32_path() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    match Host::new(true) {
+        Ok(warp) => assert!(!warp.native16(), "WARP was given native half"),
+        Err(e) => eprintln!("no SM 6.6 WARP device ({e}); skipped"),
+    }
+    if let Ok(hardware) = Host::new(false) {
+        eprintln!(
+            "{:?}: native 16-bit operations {}, a 16-bit FMad rounded once {:?}",
+            hardware.adapter_name(),
+            hardware.native16_ops(),
+            hardware.rounds_f16_fmad_once(),
+        );
+    }
 }

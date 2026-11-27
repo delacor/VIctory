@@ -29,6 +29,10 @@ pub(super) mod intersect;
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
 mod halves;
+/// 16-bit float arithmetic in native `half` (module notes, "16-bit
+/// floats"), a child module so it shares the emitter's state.
+#[path = "half.rs"]
+mod half;
 
 type Why = &'static str;
 
@@ -93,6 +97,9 @@ pub(crate) struct Parts<'a> {
     /// Mesh: emit a compute shader that writes the outputs to the mesh
     /// output UAVs ([`super::MeshLayout`]) instead of a mesh shader.
     pub mesh_as_compute: bool,
+    /// The host runs native 16-bit float operations and rounds a 16-bit
+    /// `FMad` once ([`host_native16`]): f16 arithmetic in `half`.
+    pub native16: bool,
 }
 
 enum Stop {
@@ -1556,6 +1563,34 @@ fn own_bits_on() -> bool {
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+}
+
+static HOST_NATIVE16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host runs native 16-bit float operations
+/// (D3D12 `Native16BitShaderOpsSupported`) and rounds a 16-bit `FMad` once,
+/// as the console's `v_fma_f16` does (`host::Host::native16` checks both):
+/// f16 arithmetic is then done in `half` (module notes, "16-bit floats")
+/// instead of in f32 with each result converted back.
+pub fn set_host_native16(on: bool) {
+    HOST_NATIVE16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_native16`], for its thread only.
+    pub(super) static TEST_NATIVE16: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether translations are for a host with native 16-bit float operations
+/// ([`set_host_native16`]). Part of the translation: the shader cache keys
+/// on it.
+pub fn host_native16() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NATIVE16.get() {
+        return on;
+    }
+    HOST_NATIVE16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -10062,6 +10097,9 @@ impl<'a> Lower<'a> {
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
+        if let Some(r) = self.valu16_native(inst, name, guard) {
+            return Some(r);
+        }
         const FLOAT2: &[&str] = &[
             "v_add_f16",
             "v_sub_f16",
@@ -10184,18 +10222,7 @@ impl<'a> Lower<'a> {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
+                let x = self.mac_acc_bits(inst)?;
                 self.s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
             } else {
@@ -10484,6 +10511,7 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let native = float && self.native16();
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -10493,7 +10521,17 @@ impl<'a> Lower<'a> {
                 } else {
                     self.packed_src(inst, k, high, float)?
                 };
-                if float {
+                if native {
+                    // The sign flipped on the bits, as `half` arithmetic
+                    // reads them.
+                    let neg = if high { v.neg_hi } else { v.neg };
+                    xs.push(if neg >> k & 1 != 0 {
+                        let sign = self.s.m.i32(0x8000);
+                        self.s.m.bin(c, Bin::Xor, h, sign)
+                    } else {
+                        h
+                    });
+                } else if float {
                     let mut f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
@@ -10507,7 +10545,16 @@ impl<'a> Lower<'a> {
                     xs.push(h);
                 }
             }
-            let r = if float {
+            let r = if native {
+                let r = match op {
+                    "add_f16" => self.half_bin(Bin::Add, xs[0], xs[1]),
+                    "mul_f16" => self.half_bin(Bin::Mul, xs[0], xs[1]),
+                    "min_f16" => self.max_min16(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min16(true, xs[0], xs[1]),
+                    _ => self.fma16(xs[0], xs[1], xs[2]),
+                };
+                if v.clamp { self.clamp16(r) } else { r }
+            } else if float {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
@@ -13866,6 +13913,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             mesh_as_compute: false,
+            native16: false,
         })
         .map(|_| ())
     }
@@ -13917,6 +13965,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             mesh_as_compute: false,
+            native16: false,
         })
     }
 
@@ -14088,6 +14137,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             mesh_as_compute: false,
+            native16: false,
         }).unwrap();
 
         let container =

@@ -255,14 +255,14 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    let host_caps = if pipelines {
+    let (host_caps, native16) = if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         if let Some(name) = host.adapter_name() {
             println!("pipeline adapter: {name}");
         }
-        host.translation_caps()
+        (host.translation_caps(), host.native16())
     } else {
-        None
+        (None, false)
     };
     // Without VICTORY_HOST_WAVE / VICTORY_HOST_MAX_WAVE (`wave`, set per
     // worker), translate as for the adapter the pipelines are made on.
@@ -276,6 +276,12 @@ pub fn run(
         || host_caps.is_some_and(|(_, rdna)| rdna),
         |v| v == "1",
     ));
+    // f16 arithmetic in native `half` as for the adapter the pipelines are made
+    // on, where it has it (`VICTORY_F16_IN_F32=1`: in f32, as without
+    // pipelines).
+    victory_shader::emit::set_host_native16(
+        native16 && std::env::var_os("VICTORY_F16_IN_F32").is_none_or(|v| v == "0"),
+    );
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;

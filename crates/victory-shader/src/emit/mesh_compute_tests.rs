@@ -211,6 +211,7 @@ fn lowered_native(as_compute: bool, prims: bool, native: NativeProgram) -> (Host
         prims: prim_outputs(prims),
         mesh_stride: 3,
         mesh_as_compute: as_compute,
+        native16: false,
     })
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);

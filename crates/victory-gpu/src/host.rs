@@ -1114,6 +1114,13 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // f16 arithmetic in native `half` where the card runs 16-bit operations and
+        // rounds a 16-bit FMad once (a dispatch, made here before any title shader
+        // is translated); `VICTORY_F16_IN_F32=1` keeps it in f32 on any host.
+        let native16 = !crate::switch::on("VICTORY_F16_IN_F32")
+            && victory_shader::emit::host::Host { device: device.clone() }.native16();
+        tracing::info!(native16, "host native 16-bit float operations");
+        victory_shader::emit::set_host_native16(native16);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

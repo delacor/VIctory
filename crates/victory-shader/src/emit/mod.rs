@@ -79,6 +79,26 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **16-bit floats** (native `half` on hosts that have it,
+//!   [`set_host_native16`]; port of Marvisak/VIctory#2825, 2026-11-27).
+//!   Without it, an f16 operation is done in f32 on its widened sources and
+//!   the result converted back with the host's own conversion (which may
+//!   round toward zero; `VICTORY_F16_NEAREST=1` rounds to nearest in
+//!   integer code). With it, `v_add/sub/subrev/mul_f16`, `v_fma/fmac_f16`,
+//!   `v_min/max/min3/max3/med3_f16` and the packed
+//!   `v_pk_add/mul/fma/fmac/min/max_f16` are `half` arithmetic (SM 6.2
+//!   16-bit types, flagged as native low precision), rounded to nearest
+//!   even as the console's MODE default rounds: sums, differences and
+//!   products are rounded once, minima and maxima are exact, NaN payloads
+//!   are the host's. Fused multiply-adds round once, as the console's do:
+//!   the host is only told so where its 16-bit `FMad` does (RDNA's
+//!   `v_fma_f16`; the RTX 4070 Ti and RTX 5070 Ti measured); WARP rounds it
+//!   in f32 first and keeps the f32 path. The MODE register is not
+//!   modelled, so a program that rounds toward zero gets nearest even here
+//!   too. Conversions, interpolation, `v_mad/mac_f16`, `v_fma_mix*`,
+//!   instructions with an output modifier and the transcendental and
+//!   rounding operations stay on the f32 path. The shader cache keys on
+//!   it.
 
 mod bitcode;
 mod container;
@@ -121,7 +141,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{
+    host_native16, host_settings, set_host_max_wave, set_host_native16, set_host_rdna,
+    set_thread_max_wave,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -299,6 +322,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    // (Only when on, so translations made without it keep their key.)
+    if lower::host_native16() {
+        out.extend_from_slice(b"native16");
+    }
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
@@ -992,6 +1019,7 @@ fn emit_with(
         prims,
         mesh_stride,
         mesh_as_compute,
+        native16: lower::host_native16(),
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1178,6 +1206,20 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A translation for native 16-bit float operations is keyed apart
+    /// from one for the f32 path (port of Marvisak/VIctory#2825).
+    #[test]
+    fn the_fingerprint_says_whether_f16_is_native() {
+        let with = |on| {
+            super::lower::TEST_NATIVE16.set(Some(on));
+            let f = super::translation_fingerprint();
+            super::lower::TEST_NATIVE16.set(None);
+            f
+        };
+        assert_ne!(with(false), with(true));
+        assert_eq!(with(false), with(false));
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
@@ -2485,6 +2527,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2615,6 +2658,7 @@ mod tests {
                 outputs: Vec::new(),
                 prims: Vec::new(),
                 mesh_stride: 0,
+                native16: false,
             })
             .unwrap();
             super::shader::CONSTANTS_RAW_HERE.set(None);
@@ -2775,6 +2819,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

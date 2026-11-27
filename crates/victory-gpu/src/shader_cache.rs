@@ -146,6 +146,12 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    // f16 arithmetic in native `half` (the host decides): only when on, so the
+    // translations cached without it keep their key, and one path's entries
+    // never serve the other.
+    if victory_shader::emit::host_native16() {
+        hash.update(b"native16");
+    }
     *hash.finalize().as_bytes()
 }
 

@@ -70,6 +70,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         mesh_as_compute: false,
+        native16: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -371,6 +372,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .unwrap_or_else(|e| panic!("{case_name}: lower failed: {e}"));
 
