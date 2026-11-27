@@ -1695,6 +1695,27 @@ fn a_frame_is_recorded_and_replayed() {
     // It goes on as it did without the recorder.
     scene.frame(4);
     let after = scene.outcome();
+    if after != without {
+        let diff = |name: &str, a: &[u8], b: &[u8]| {
+            let first: Vec<_> = a.iter().zip(b).enumerate()
+                .filter(|(_, (a, b))| a != b).take(12)
+                .map(|(i, (a, b))| (i, *a, *b)).collect();
+            let count = a.iter().zip(b).filter(|(a,b)| a != b).count();
+            eprintln!("RECORDER_DIFF {name}: lengths {} / {}, changed {count}, first {first:?}", a.len(), b.len());
+        };
+        diff("picture", &without.picture, &after.picture);
+        diff("image", &without.image, &after.image);
+        diff("sum", &without.sum, &after.sum);
+        diff("shared", &without.shared, &after.shared);
+        eprintln!("RECORDER_DIFF still_equal={}", without.still == after.still);
+        for (a,b) in without.still.iter().zip(&after.still) {
+            for (sub, ((_,ar),(_,br))) in a.subs.iter().zip(&b.subs).enumerate() {
+                let av: Vec<_> = ar.iter().flatten().copied().collect();
+                let bv: Vec<_> = br.iter().flatten().copied().collect();
+                diff(&format!("{} sub{sub}", a.name), &av, &bv);
+            }
+        }
+    }
     assert!(
         after == without,
         "the recorder changed what the program makes"
