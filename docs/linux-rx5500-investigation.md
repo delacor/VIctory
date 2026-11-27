@@ -904,3 +904,63 @@ per-record descriptor cache. Cache FORMAT4/VSH4 separates the new metadata from
 both accepted VSH2 and the rejected root-write experiment's VSH3. Compilation
 and GPU execution are pending; the PR title is not evidence that it fixes this
 machine's missing geometry.
+
+## Refreshed PRs and correctness priorities (27 November, 02:59 UTC)
+
+The second complete open-PR refresh reads every list page again across eight
+repositories: 3,131 entries, no duplicates or page errors, and 169 new/changed
+heads relative to the previous refresh. Belobug's active a-publier remains
+4eb6cfdf9; its older main is not its current development branch. This is complete
+metadata coverage, not a claim that every patch has passed review or tests.
+
+The 16-MiB threshold trial 023521 completed 361.8 seconds in 3D. Warm frame-log
+medians over 120–350 seconds were 174.1 ms versus the reference run's 173.65 ms;
+draw medians were 1080 versus 1117. Missing body/scenery persisted. It does not
+establish a useful placement gain; subsequent comparisons restore the 64-KiB
+control threshold and keep the same output dimensions.
+
+The complete final half-buffer PR #927 is ported as 728182529 and retained on
+the accepted branch as 9a2b5454a. The grouped-table adaptation keeps actual
+descriptor offsets, mixed-use/runtime-selected exclusions, the existing
+heap-picked fallback, and separate cache FORMAT4/VSH4 metadata. A half twin
+bypasses the fork's title-word-only per-record descriptor cache. Windows
+workspace/all-target checking and the optimized application build pass.
+The half and halves shader filters execute 10 and 13 successful checks; GPU
+metadata/table and numerical filters execute 3 and 2. Cache checks pass too.
+A table_plan filter matched zero tests and is not validation evidence.
+
+Actual RX 5500 XT GPU readback preserves all 65,536 half-bit patterns through
+the unsigned view versus only one through the former float path. This qualifies
+the numerical correction. Replay 024910 completes 361.6 seconds in 3D without
+a logged exception/reset, with a 170.25-ms warm frame-log median, but body and
+scenery remain missing. Its fresh VSH4 cache also affects loading. Do not claim
+an isolated FPS gain or a fix for the full intro.
+
+Belobug #428 (6bc90e3204, attributed local import 6b6bbf122) addresses an
+unsynchronized cross-queue read/write in the enabled RELAY_COPY path. A fetch
+of a copy still written by a later flight moves behind it on the drawing queue;
+a later submission writing a copy being fetched waits on the copy-queue fence.
+This supersedes attempting to repair values after catching a partial write.
+The explicit queue-ownership test, seven relay checks, two torn-copy checks,
+and both actual-GPU ordering regressions pass locally. With FETCH_CHECK=0,
+the 12-round regression reports zero wrong title results, zero undone GPU
+results and zero repaired/suspect pieces. The unchanged unsafe path was not
+replayed locally just to provoke a race. The Windows workspace check passes;
+application build and game replay are still pending at this update.
+
+Range PRs Belobug #440/#437 are preserved as 88d17d8c4/ab52b7e03 with a
+default-off measured gate dbb3e63ee on perf20/range-sweeps-20261127. Their
+compile/replay was deferred to validate relay ordering first. No speed claim.
+
+Further triage:
+- Belobug #449's legal-before-state adjustment is already covered by this
+  fork's HostList::transition, which legalizes and deduplicates states.
+- #421's Wine HLSL compiler workarounds overlap the working DXC/source-root
+  fallback here; no current compilation failure justifies treating them as a
+  new measured fix.
+- fxceless #1422 needs the bake-source infrastructure absent from this branch;
+  it cannot be applied as a standalone body/scenery fix.
+- Belobug #453 combines writable placed textures, texture conversion, caching
+  and warm-up changes. It needs separation/review and is not yet accepted.
+- #443's cache-lock creation changes overlap our existing prune/pool work and
+  require an adaptation that preserves placed-resource ownership.

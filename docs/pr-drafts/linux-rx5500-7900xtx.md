@@ -185,3 +185,11 @@ has passed actual-GPU allocation/readback and budget-reset checks but still
 needs a replay. The 16-MiB placement-threshold replay and complete half-buffer
 PR port are under evaluation; neither supports a new performance or visual
 correctness claim. The investigation ledger contains exact scope and results.
+
+The complete final half-buffer correction from fxceless #927 is now retained
+(9a2b5454a), with actual GPU readback of all 65,536 bit patterns. Its six-minute
+replay still has missing body/scenery, so it supports no full-intro fix or new
+FPS claim. The newer relay ordering PR Belobug #428 is next: both numerical GPU
+ordering regressions pass with the old repair checker off, but its game replay
+is still pending. Coordinate follow-ups with those existing PRs and preserve
+their authorship; these are attributed imports, not new submissions of our own.
