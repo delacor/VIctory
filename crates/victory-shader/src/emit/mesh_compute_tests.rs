@@ -568,6 +568,13 @@ fn run_compute_all(
 fn run_compute_mode(
     host: &Host, cs: &HostShader, layout: &MeshLayout, groups: u32, indirect: bool,
 ) -> Result<[Vec<u32>; 3], String> {
+    run_compute_signature(host, cs, layout, groups, indirect, false)
+}
+
+fn run_compute_signature(
+    host: &Host, cs: &HostShader, layout: &MeshLayout, groups: u32,
+    indirect: bool, stateful: bool,
+) -> Result<[Vec<u32>; 3], String> {
     let gpu = Gpu::new(host)?;
     let pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
     let outs = gpu.mesh_buffers(layout, groups)?;
@@ -594,28 +601,40 @@ fn run_compute_mode(
                 },
             },
         };
-        let entries = [uav(0), uav(1), uav(2), D3D12_INDIRECT_ARGUMENT_DESC {
+        let dispatch = D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default()
-        }];
+        };
+        let entries = if stateful { vec![uav(0), uav(1), uav(2), dispatch] } else { vec![dispatch] };
+        let bytes_per_record = if stateful { 40 } else { 12 };
         let desc = D3D12_COMMAND_SIGNATURE_DESC {
-            ByteStride: 40, NumArgumentDescs: 4, pArgumentDescs: entries.as_ptr(), NodeMask: 0,
+            ByteStride: bytes_per_record, NumArgumentDescs: entries.len() as u32,
+            pArgumentDescs: entries.as_ptr(), NodeMask: 0,
         };
         let mut signature: Option<ID3D12CommandSignature> = None;
-        let arguments = gpu.buffer(D3D12_HEAP_TYPE_UPLOAD, 40,
+        let arguments = gpu.buffer(D3D12_HEAP_TYPE_UPLOAD, u64::from(bytes_per_record),
             D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut bytes = Vec::new();
         // SAFETY: the resources and argument descriptions remain live.
         unsafe {
-            for out in &outs { bytes.extend(out.GetGPUVirtualAddress().to_le_bytes()); }
-            for word in [groups, 1, 1, 0] { bytes.extend(word.to_le_bytes()); }
+            if stateful {
+                for out in &outs { bytes.extend(out.GetGPUVirtualAddress().to_le_bytes()); }
+            }
+            for word in [groups, 1, 1] { bytes.extend(word.to_le_bytes()); }
+            if stateful { bytes.extend(0u32.to_le_bytes()); }
             let mut mapped = std::ptr::null_mut();
             arguments.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped)).map_err(err)?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
-            arguments.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 40 }));
-            gpu.dev.CreateCommandSignature(&desc, &gpu.root, &mut signature).map_err(err)?;
+            arguments.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: bytes.len() }));
+            let root = stateful.then_some(&gpu.root);
+            gpu.dev.CreateCommandSignature(&desc, root, &mut signature).map_err(err)?;
             let signature = signature.ok_or("no indirect signature")?;
             list.SetPipelineState(&pso);
             list.SetComputeRootSignature(&gpu.root);
+            if !stateful {
+                for (param, out) in outs.iter().enumerate() {
+                    list.SetComputeRootUnorderedAccessView(param as u32, out.GetGPUVirtualAddress());
+                }
+            }
             list.ExecuteIndirect(&signature, 1, &arguments, 0, None, 0);
             Some((signature, arguments))
         }
@@ -1153,4 +1172,17 @@ fn software_mesh_bundles_and_plain_indirect_draws_preserve_the_image() {
         }
     }
     eprintln!("MESH_BUNDLE visible images match: indexed/expanded, groups1/3, direct indirect, bundled direct and bundled plain indirect");
+}
+
+/// Preserve the original state-changing-signature coverage separately.
+/// Our Wine profile disables DGC, where that optional form executes no work.
+#[test]
+#[ignore = "requires state-changing indirect/DGC support; run separately from portable Wine profile"]
+fn stateful_indirect_mesh_compute_matches_direct_output() {
+    let host = Host::new(false).expect("a hardware SM6.6 device");
+    let (cs, layout) = lowered_with(true, true);
+    let direct = run_compute_signature(&host, &cs, &layout, 2, false, false).unwrap();
+    let stateful = run_compute_signature(&host, &cs, &layout, 2, true, true).unwrap();
+    assert_eq!(stateful, direct);
+    assert!(stateful[2].chunks_exact(4).any(|r| r[2] == 256));
 }
