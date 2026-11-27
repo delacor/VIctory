@@ -111,3 +111,20 @@ The new application SHA-256 is
 49a0640a39aef4c823afbb5c793a98049e8ed04e05379d35dcdfcaf4a8a2524c.
 Clippy has not been run for this combined candidate. Live FPS validation remains
 pending; passing tests are not a speedup claim.
+
+## Reported visual regressions
+
+During this live run the user reports consistent face and wall rendering, but
+unacceptably low speed. They also report that skin had more detail around five
+or six builds earlier; the exact earlier binary is not identified. Keep that
+regression open. Loading artwork at frame 1024 is not a valid 3D skin reference,
+and the available later captures mostly show the character from behind.
+Preserve archived binaries and compare the same face angle before declaring
+rendering fixed. Scene differences alone are not evidence that a regression
+has been resolved.
+
+The dense opening replay captured the correct skin-visible close-up. The user
+selected frame 1929 as the comparison shot. Its unmodified PNG, checksum,
+source commit and binary hash are preserved privately with the run. This is
+a reference selection, not confirmation that skin detail is correct. Do not
+commit game screenshots or substitute loading artwork for that shot.
