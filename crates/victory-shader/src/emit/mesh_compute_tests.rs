@@ -769,6 +769,16 @@ fn has_mesh_shaders(host: &Host) -> bool {
 /// Draws `groups` groups of the program with `ps` into a [`SIZE`]² RGBA32F
 /// target cleared to -1, and returns its texels row by row.
 fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<[f32; 4]>, String> {
+    render_mode(host, draw, ps, groups, false, false)
+}
+
+/// A feasibility probe for deferred graphics: bundles inherit the parent's
+/// root resources, but explicitly set their own PSO and topology. All barriers,
+/// targets, viewports and copies remain on the DIRECT list.
+fn render_mode(
+    host: &Host, draw: &Draw, ps: &HostShader, groups: u32,
+    bundled: bool, indirect: bool,
+) -> Result<Vec<[f32; 4]>, String> {
     let gpu = Gpu::new(host)?;
     let dev = gpu.dev;
     let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -865,16 +875,60 @@ fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<
             bottom: SIZE as i32,
             ..Default::default()
         }]);
+        let mut bundle_keep: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList6)> = None;
+        let mut signature_keep: Option<ID3D12CommandSignature> = None;
+        let mut arguments_keep: Option<ID3D12Resource> = None;
         match *draw {
-            Draw::Mesh(_) => list.DispatchMesh(groups, 1, 1),
-            Draw::Fallback {
-                layout, expanded, ..
-            } => {
+            Draw::Mesh(_) => {
+                assert!(!bundled && !indirect, "probe modes only apply to software mesh");
+                list.DispatchMesh(groups, 1, 1);
+            }
+            Draw::Fallback { layout, expanded, .. } => {
                 let n = 3 * layout.max_primitives * groups;
-                if expanded {
-                    list.DrawInstanced(n, 1, 0, 0);
+                if bundled {
+                    let allocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE).map_err(err)?;
+                    let bundle: ID3D12GraphicsCommandList6 = dev.CreateCommandList(
+                        0, D3D12_COMMAND_LIST_TYPE_BUNDLE, &allocator, None,
+                    ).map_err(err)?;
+                    bundle.SetPipelineState(&draw_pso);
+                    bundle.IASetPrimitiveTopology(
+                        windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                    );
+                    bundle_keep = Some((allocator, bundle));
+                }
+                let commands = bundle_keep.as_ref().map_or(&list, |(_, bundle)| bundle);
+                if indirect {
+                    // Exactly one draw operation, no count buffer or indirect
+                    // state changes: the documented bundle-supported form.
+                    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                        Type: if expanded { D3D12_INDIRECT_ARGUMENT_TYPE_DRAW }
+                            else { D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED },
+                        ..Default::default()
+                    };
+                    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: if expanded { 16 } else { 20 },
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &argument,
+                        NodeMask: 0,
+                    };
+                    dev.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature_keep).map_err(err)?;
+                    let arguments = gpu.buffer(D3D12_HEAP_TYPE_UPLOAD, 32,
+                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+                    let mut mapped = std::ptr::null_mut();
+                    arguments.Map(0, None, Some(&mut mapped)).map_err(err)?;
+                    let words = [n, 1, 0, 0, 0];
+                    std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast::<u32>(), words.len());
+                    arguments.Unmap(0, None);
+                    commands.ExecuteIndirect(signature_keep.as_ref().unwrap(), 1, &arguments, 0, None, 0);
+                    arguments_keep = Some(arguments);
+                } else if expanded {
+                    commands.DrawInstanced(n, 1, 0, 0);
                 } else {
-                    list.DrawIndexedInstanced(n, 1, 0, 0, 0);
+                    commands.DrawIndexedInstanced(n, 1, 0, 0, 0);
+                }
+                if let Some((_, bundle)) = &bundle_keep {
+                    bundle.Close().map_err(err)?;
+                    list.ExecuteBundle(bundle);
                 }
             }
         }
@@ -908,7 +962,7 @@ fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<
         };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         gpu.run(&list)?;
-        drop(draw_pso);
+        drop((bundle_keep, signature_keep, arguments_keep, draw_pso));
     }
     drop((keep, keep_buffers));
     let words = Gpu::read(&readback, (pitch * SIZE / 4) as usize)?;
@@ -1074,4 +1128,29 @@ fn mesh_export_probe_marks_dispatches_even_without_exports() {
         let expected: Vec<u32> = (0..2).flat_map(|_| (0u32..3).flat_map(|lane| [0,0,64,lane])).collect();
         assert_eq!(records, expected);
     });
+}
+
+/// This verifies a legal recording mechanism, not a gameplay optimization.
+/// Cross-call batching still needs production hazard and lifetime analysis.
+#[test]
+#[ignore = "isolated hardware adapter, no native mesh support required"]
+fn software_mesh_bundles_and_plain_indirect_draws_preserve_the_image() {
+    let host = Host::new(false).expect("a hardware SM6.6 device");
+    for prims in [false, true] {
+        let (cs, layout) = lowered_with(true, prims);
+        let vs = fallback_vs_with(&layout, prims);
+        let ps = pixel_shader(prims);
+        let draw = Draw::Fallback { cs: &cs, vs: &vs, layout: &layout, expanded: prims };
+        for groups in [1, 3] {
+            let expected = render(&host, &draw, &ps, groups).expect("direct reference");
+            assert!(expected.iter().any(|p| p[1] != -1.0), "reference must actually draw visible pixels");
+            for (bundled, indirect) in [(false, true), (true, false), (true, true)] {
+                let got = render_mode(&host, &draw, &ps, groups, bundled, indirect)
+                    .unwrap_or_else(|e| panic!("prims={prims} groups={groups} bundle={bundled} indirect={indirect}: {e}"));
+                same_image(&expected, &got, 1e-6).unwrap_or_else(|e|
+                    panic!("prims={prims} groups={groups} bundle={bundled} indirect={indirect}: {e}"));
+            }
+        }
+    }
+    eprintln!("MESH_BUNDLE visible images match: indexed/expanded, groups1/3, direct indirect, bundled direct and bundled plain indirect");
 }
