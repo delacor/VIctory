@@ -2415,6 +2415,15 @@ struct MeshScratch {
     pools: [Pool; 2],
 }
 
+impl Drop for MeshScratch {
+    fn drop(&mut self) {
+        // A list can be destroyed without another reset. These chunks then
+        // leave its pools directly instead of passing through RELEASING.
+        let bytes: u64 = self.pools.iter().flat_map(|pool| &pool.chunks).map(|c| c.1).sum();
+        MESH_CHUNK_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
 /// Which memory a mesh fallback draw asks for: what the mesh program writes,
 /// or the commands an indirect draw executes. Kept apart because a draw
 /// moves the chunks it uses between states, and an indirect draw reads its
