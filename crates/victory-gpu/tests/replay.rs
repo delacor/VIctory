@@ -1901,4 +1901,33 @@ fn a_frame_is_recorded_and_replayed() {
     assert_eq!(both.len(), 2);
     assert!(both.iter().all(|(_, r)| r.picture.unwrap().1));
     assert!(folder.join("replay.png").exists() && folder.join("replay-unchanged.png").exists());
+    // An experiment that draws another picture: each report has the picture
+    // of its own runs, though the card holds the last run's (the
+    // experiment's) when the reports are made.
+    let o = Options {
+        compare: true,
+        skip_shaders: vec!["a drawing".into()],
+        loops: 2,
+        ..Default::default()
+    };
+    let both = play::replay(dir.path(), &o).unwrap();
+    assert!(
+        both[0].1.picture.unwrap().1,
+        "the unchanged run's picture is the presented one"
+    );
+    assert!(
+        !both[1].1.picture.unwrap().1,
+        "without its draws the picture is another"
+    );
+    let png = |name: &str| std::fs::read(folder.join(name)).unwrap();
+    assert_ne!(png("replay-unchanged.png"), png("replay.png"));
+    // The picture a report names is the one of its last loop.
+    for (what, r) in &both {
+        let last = &r.pictures.last().unwrap().1[..16];
+        assert!(
+            r.notes.iter().any(|n| n.contains(&format!("blake3 {last}"))),
+            "{what}: {:?}",
+            r.notes
+        );
+    }
 }

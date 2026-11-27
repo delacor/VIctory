@@ -225,7 +225,7 @@ impl Player {
                             now = self.after(&unit, &now);
                         }
                         self.at = now;
-                        if let Some((db, _, hash, rgb)) = self.picture_now()? {
+                        if let Some(Shown { db, hash, rgb, .. }) = self.picture_now()? {
                             pictures.push((db, hash, rgb));
                         }
                     }

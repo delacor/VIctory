@@ -2363,6 +2363,7 @@ impl Player {
             _back: back,
             data: data as usize,
             count: next,
+            shown: None,
         })
     }
 
@@ -3137,8 +3138,12 @@ impl Player {
         self.restore(o.restore)?;
         self.fresh = false;
         let stamps = self.send(built, o)?;
-        if let Some((db, _, hash, _)) = self.picture_now()? {
-            report.pictures.push((db, hash));
+        // Kept for the report: with two sets of lists run turn by turn
+        // (`--compare`) the card holds the other's picture by the time
+        // this one's report is made.
+        built.shown = self.picture_now()?;
+        if let Some(shown) = &built.shown {
+            report.pictures.push((shown.db, shown.hash.clone()));
         }
         let ms = |a: u32, b: u32| {
             stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency
@@ -3179,7 +3184,7 @@ impl Player {
             let notes = self.merge_notes(o.loops)?;
             report.notes.extend(notes);
         }
-        self.picture(o, &mut report)?;
+        self.picture(o, &mut report, built.shown)?;
         if let Some(q) = &self.info {
             report.notes.extend(debug_messages(q));
         }
@@ -3247,9 +3252,8 @@ impl Player {
             .collect();
     }
 
-    /// The presented picture as it is now: dB against the recorded one,
-    /// whether its bytes are the same, its hash, and its pixels.
-    fn picture_now(&mut self) -> Result<Option<(f64, bool, String, Vec<u8>)>> {
+    /// The presented picture as it is now.
+    fn picture_now(&mut self) -> Result<Option<Shown>> {
         let Some(p) = self.frame.presents.last().cloned() else {
             return Ok(None);
         };
@@ -3266,51 +3270,55 @@ impl Player {
             p.file,
         )?;
         let was = gpu::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
-        let hash = blake3::hash(&rgb).to_hex().to_string();
-        Ok(Some((
-            gpu::psnr(&rgb, &was),
-            rows_equal(&p, &bytes, &recorded),
-            hash,
+        Ok(Some(Shown {
+            db: gpu::psnr(&rgb, &was),
+            same: rows_equal(&p, &bytes, &recorded),
+            hash: blake3::hash(&rgb).to_hex().to_string(),
+            recorded: blake3::hash(&was).to_hex().to_string(),
             rgb,
-        )))
+        }))
     }
 
-    /// Saves the presented picture and compares it with the recorded one.
-    fn picture(&mut self, o: &Options, report: &mut Report) -> Result<()> {
+    /// Saves the picture and compares it with the recorded one: the one
+    /// `shown` after the last run of the report's lists, or without one
+    /// what the card holds now.
+    fn picture(&mut self, o: &Options, report: &mut Report, shown: Option<Shown>) -> Result<()> {
         let Some(p) = self.frame.presents.last().cloned() else {
             report.notes.push("no picture was presented".into());
             return Ok(());
         };
-        let Some(bytes) = self.contents(p.res)? else {
-            report
-                .notes
-                .push("the presented texture is not there".into());
-            return Ok(());
-        };
-        let Some(rgb) = gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes) else {
-            report
-                .notes
-                .push("the presented format is not shown".into());
-            return Ok(());
+        let shown = match shown {
+            Some(shown) => shown,
+            None => {
+                let Some(bytes) = self.contents(p.res)? else {
+                    report
+                        .notes
+                        .push("the presented texture is not there".into());
+                    return Ok(());
+                };
+                if gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes).is_none() {
+                    report
+                        .notes
+                        .push("the presented format is not shown".into());
+                    return Ok(());
+                }
+                let Some(shown) = self.picture_now()? else {
+                    return Ok(());
+                };
+                shown
+            }
         };
         let path = o
             .image
             .clone()
             .unwrap_or_else(|| self.folder.join("replay.png"));
-        std::fs::write(&path, crate::capture::png(p.width, p.height, &rgb))?;
-        let mut recorded = vec![0; bytes.len()];
-        read_at(
-            &File::open(self.folder.join("present.bin"))?,
-            &mut recorded,
-            p.file,
-        )?;
-        let was = gpu::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
-        report.picture = Some((gpu::psnr(&rgb, &was), rows_equal(&p, &bytes, &recorded)));
+        std::fs::write(&path, crate::capture::png(p.width, p.height, &shown.rgb))?;
+        report.picture = Some((shown.db, shown.same));
         report.notes.push(format!(
             "picture {} (blake3 {}; recorded {})",
             path.display(),
-            &blake3::hash(&rgb).to_hex()[..16],
-            &blake3::hash(&was).to_hex()[..16]
+            &shown.hash[..16],
+            &shown.recorded[..16]
         ));
         Ok(())
     }
@@ -3385,6 +3393,20 @@ struct Sends {
     _back: ID3D12Resource,
     data: usize,
     count: u32,
+    /// The picture after the last run of these lists.
+    shown: Option<Shown>,
+}
+
+/// The presented picture as a run left it.
+struct Shown {
+    /// Against the recorded picture: dB (infinite: the same).
+    db: f64,
+    /// Whether its bytes are the recorded ones.
+    same: bool,
+    /// Its hash (blake3, hex), and the recorded picture's.
+    hash: String,
+    recorded: String,
+    rgb: Vec<u8>,
 }
 
 fn rows_equal(p: &wire::Present, a: &[u8], b: &[u8]) -> bool {
