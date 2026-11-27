@@ -1423,6 +1423,9 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: std::sync::Arc<Mutex<Vec<Note>>>,
+    /// Inline readbacks, mapped only after this list has completed.
+    #[cfg(feature = "diagnostics")]
+    pass_captures: Mutex<Vec<crate::capture::PassSnapshot>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -4557,6 +4560,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
+                pass_captures: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -6846,6 +6851,10 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        for capture in std::mem::take(&mut *self.pass_captures.lock().unwrap_or_else(|e| e.into_inner())) {
+            capture.save();
+        }
         self.resets.fetch_add(1, Ordering::Relaxed);
         self.changed_something();
         #[cfg(feature = "diagnostics")]
@@ -6959,6 +6968,34 @@ impl HostList {
                 }
                 (before != wanted).then_some((texture, before))
             }
+        }
+    }
+
+    /// A bounded inline readback, with the resource state restored before the
+    /// next command. Ownership lasts until reset, after this submission ran.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_pass(&self, resource: crate::object::This, label: &str) {
+        let Some(copy) = crate::resource::host_copy(resource) else { return };
+        let key = std::sync::Arc::as_ptr(&copy) as usize;
+        let state = self.states.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|s| s.1);
+        // A pass can only inspect textures that bind/prepare already tracks.
+        let Some(state) = state else { return };
+        let Some(host) = host() else { return };
+        // SAFETY: the copy is held by states for the list's lifetime.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1
+        {
+            return;
+        }
+        let Some(name) = crate::capture::reserve_pass(&host.device, &desc, label) else { return };
+        self.settle(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let read = crate::capture::read_back(&host.device, &self.list, &copy.texture);
+        self.settle(&copy, state);
+        if let Some((buffer, footprint)) = read {
+            self.pass_captures.lock().unwrap_or_else(|e| e.into_inner()).push(
+                crate::capture::PassSnapshot { name, buffer, footprint },
+            );
         }
     }
 

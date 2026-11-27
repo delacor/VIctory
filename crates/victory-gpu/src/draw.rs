@@ -2884,18 +2884,52 @@ impl State {
             }
         }
         // SAFETY: an open list with everything set.
+        #[cfg(feature = "diagnostics")]
+        self.capture_pass(list, true, "before");
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        self.capture_pass(list, true, "after");
+
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
+            #[cfg(feature = "diagnostics")]
+            self.capture_pass(list, true, "ambient-after");
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
+        }
+    }
+
+    /// One selected pass, copied at its actual place in this GPU list.
+    #[cfg(feature = "diagnostics")]
+    fn capture_pass(&self, list: &HostList, compute: bool, phase: &str) {
+        let specs = crate::capture::pass_specs();
+        if specs.is_empty() { return }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        for (hash, view) in specs {
+            if !p.stages.iter().any(|stage| stage.shader.hash == *hash) { continue }
+            match (compute, view) {
+                (false, None) => {
+                    for (i, &resource) in self.targets.iter().chain(std::iter::once(&self.depth)).enumerate() {
+                        if resource != 0 {
+                            list.capture_pass(resource as This, &format!("{hash}-{phase}-target{i}"));
+                        }
+                    }
+                }
+                (true, Some((slot, offset))) => {
+                    let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(*slot)) else { continue };
+                    if let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + u64::from(*offset) * 4) {
+                        list.capture_pass(resource as This, &format!("{hash}-{phase}-u{slot}-{offset}"));
+                    }
+                }
+                _ => {},
+            }
         }
     }
 
@@ -4021,11 +4055,16 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.capture_pass(list, false, "before");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.capture_pass(list, false, "after");
+
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

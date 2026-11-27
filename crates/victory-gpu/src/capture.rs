@@ -121,7 +121,8 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     let what = what();
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
-        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+        let Ok(made) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(folder.join(format!("frame-{frame}-ops.txt"))) else {
             return;
         };
         *file = Some((frame, 0, made));
@@ -952,5 +953,150 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+// One opt-in frame of inline pass readbacks. This diagnoses where a texture's
+// contents change, rather than only seeing the final target at present.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct PassSnapshot {
+    pub(crate) name: String,
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
+#[cfg(feature = "diagnostics")]
+impl PassSnapshot {
+    pub(crate) fn save(self) {
+        let f = self.footprint.Footprint;
+        with_readback_bytes(&self.buffer, |rows| {
+            // Raw private samples preserve HDR values and avoid comparing
+            // independently normalized PNGs as if they had a common scale.
+            if let Some(folder) = folder() {
+                let _ = std::fs::write(folder.join(format!("{}.bin", self.name)), rows);
+                let metadata = format!(
+                    "{{\"width\":{},\"height\":{},\"pitch\":{},\"format\":{},\"bytes\":{}}}\n",
+                    f.Width, f.Height, f.RowPitch, f.Format.0, rows.len(),
+                );
+                let _ = std::fs::write(folder.join(format!("{}.json", self.name)), metadata);
+            }
+            if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize,
+                f.Height as usize, f.RowPitch as usize, rows)
+            {
+                let nonzero = rgba.chunks_exact(4).filter(|p| p[..3].iter().any(|&v| v != 0)).count();
+                tracing::info!(name = %self.name, format = f.Format.0, nonzero,
+                    "completed inline pass readback");
+                save_as(&self.name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            } else {
+                tracing::info!(name = %self.name, format = f.Format.0, "inline pass format not decoded");
+            }
+        });
+    }
+}
+
+/// A hash alone selects graphics color/depth targets; hash/slot/dwords selects
+/// one compute UAV table view. Nothing is captured until folder/pass-now exists.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pass_specs() -> &'static [(String, Option<(u8, u32)>)] {
+    static SPECS: std::sync::OnceLock<Vec<(String, Option<(u8, u32)>)>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| std::env::var("VICTORY_PASS_CAPTURE").unwrap_or_default()
+        .split(',').filter_map(|spec| {
+            let parts: Vec<_> = spec.trim().split('/').collect();
+            let hash = *parts.first()?;
+            if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) { return None }
+            let view = match parts.as_slice() {
+                [_] => None,
+                [_, slot, offset] => Some((slot.parse().ok()?, offset.parse().ok()?)),
+                _ => return None,
+            };
+            Some((hash.to_ascii_lowercase(), view))
+        }).collect())
+}
+
+/// At most twelve images and 64 MiB of readback buffers, for one present
+/// interval per process. Query the actual footprint before reserving bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn reserve_pass(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, label: &str) -> Option<String> {
+    static STATE: std::sync::Mutex<(Option<u64>, usize, u64)> = std::sync::Mutex::new((None, 0, 0));
+    let folder = folder()?;
+    let frame = crate::queue::presented() + 1;
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0.is_none() {
+        let trigger = folder.join("pass-now");
+        if std::fs::remove_file(trigger).is_err() { return None }
+        state.0 = Some(frame);
+    }
+    if state.0 != Some(frame) || state.1 >= 12 { return None }
+    let mut bytes = 0;
+    // SAFETY: an ordinary footprint query with owned output storage.
+    unsafe { device.GetCopyableFootprints(desc, 0, 1, 0, None, None, None, Some(&mut bytes)); }
+    if bytes == u64::MAX || state.2.checked_add(bytes)? > 64 << 20 { return None }
+    let name = format!("pass-{frame}-{:02}-{label}", state.1);
+    state.1 += 1;
+    state.2 += bytes;
+    Some(name)
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod pass_tests {
+    use super::*;
+
+    #[test]
+    fn inline_readbacks_keep_the_contents_from_each_gpu_position() {
+        let host = crate::host::host().expect("a hardware D3D12 device");
+        // SAFETY: owned descriptions/resources and a list that execute waits for.
+        unsafe {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4, Height: 3, DepthOrArraySize: 1, MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                None, &mut texture,
+            ).unwrap();
+            let texture = texture.unwrap();
+            let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1,
+                    ..Default::default()
+                },
+            ).unwrap();
+            let view = views.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(&texture, None, view);
+            let list = host.new_list().unwrap();
+            let snapshot = || {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &texture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let read = read_back(&host.device, &list.list, &texture).unwrap();
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                read
+            };
+            list.list.ClearRenderTargetView(view, &[1.0, 0.0, 0.0, 1.0], None);
+            let before = snapshot();
+            list.list.ClearRenderTargetView(view, &[0.0, 0.0, 1.0, 1.0], None);
+            let after = snapshot();
+            list.close();
+            host.execute(&[&list]);
+            for ((buffer, footprint), expected) in [
+                (before, [255, 0, 0, 255]),
+                (after, [0, 0, 255, 255]),
+            ] {
+                with_readback_bytes(&buffer, |rows| {
+                    for y in 0..3 {
+                        for x in 0..4 {
+                            let at = y * footprint.Footprint.RowPitch as usize + x * 4;
+                            assert_eq!(&rows[at..at + 4], &expected);
+                        }
+                    }
+                });
+            }
+        }
     }
 }
