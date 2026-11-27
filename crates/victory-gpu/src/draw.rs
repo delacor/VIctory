@@ -3464,18 +3464,21 @@ impl State {
                 if let Some(hash) = selected
                     && p.stages.first().is_some_and(|s| s.shader.hash == *hash)
                 {
-                    let sampled = f.layout.bytes(2);
+                    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+                    let vertices = f.layout.bytes(16);
+                    let triangles = f.layout.bytes(128);
                     let ranges = [
-                        (data.offset, sampled[0].min(regions.indices)),
-                        (data.offset + regions.indices, sampled[1].min(regions.index_bytes)),
-                        (data.offset + regions.prims, sampled[2].min(regions.bytes - regions.prims)),
+                        (data.offset, vertices[0].min(regions.indices)),
+                        (data.offset + regions.indices, triangles[1].min(regions.index_bytes)),
+                        (data.offset + regions.prims, triangles[2].min(regions.bytes - regions.prims)),
                     ];
-                    list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}"));
+                    list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}-attempt{attempt}"));
                     let ranges = [
                         (commands.offset, u64::from(records.min(32)) * u64::from(COMPUTE_STRIDE)),
                         (commands.offset + draws, u64::from(records.min(32)) * u64::from(draw_stride(f.expanded))),
                     ];
-                    list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}"));
+                    list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}-attempt{attempt}"));
                 }
             }
             drawn = self.prepare_for(list, false, true);
