@@ -169,7 +169,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let misses = MISSES.load(Ordering::Relaxed);
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, true)?,
+        Some(cache) => cached(cache, &build(), container, translate, CacheUse::Precompile)?,
         None => translate(container)?,
     };
     // (Counts other threads' misses too: the caller only adds them up.)
@@ -181,18 +181,19 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
+        Some(cache) => cached(cache, &build(), container, translate, CacheUse::Run { refresh: refresh_in_runs() }),
         None => translate(container),
     }
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. Keep the result so a run can use it even if
+/// the cache cannot publish it.
 struct Translate<'a, F> {
     translate: F,
     /// The build of the translator, written into the entry.
     source: &'a str,
-    ran: AtomicBool,
+    shader: OnceLock<HostShader>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<'_, F> {
@@ -204,22 +205,37 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+        let bytes = encode(&shader, self.source);
+        let _ = self.shader.set(shader);
+        Ok(bytes)
     }
 }
 
-/// `refresh`: an entry an earlier build of the translator made is
-/// translated again (and replaced) rather than served.
+#[derive(Clone, Copy)]
+enum CacheUse {
+    Run { refresh: bool },
+    Precompile,
+}
+
+impl CacheUse {
+    fn refresh(self) -> bool {
+        match self {
+            Self::Run { refresh } => refresh,
+            Self::Precompile => true,
+        }
+    }
+}
+
+/// Translates a shader or serves it from the cache.
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-    refresh: bool,
+    usage: CacheUse,
 ) -> Result<HostShader, String> {
-    cached_by(cache, build, SOURCE, container, translate, refresh)
+    cached_by(cache, build, SOURCE, container, translate, usage)
 }
 
 /// [`cached`] with the build of the translator given (`source`).
@@ -229,24 +245,42 @@ fn cached_by(
     source: &str,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-    refresh: bool,
+    usage: CacheUse,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
-    let converter = Translate {
+    let mut converter = Translate {
         translate,
         source,
-        ran: AtomicBool::new(false),
+        shader: OnceLock::new(),
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = cache.get_or_convert(&converter, &input);
+        if let Some(shader) = converter.shader.take() {
+            match path {
+                Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
+                Err(error) if matches!(usage, CacheUse::Run { .. }) => {
+                    static SAID: AtomicBool = AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(%error, "shader cache write failed; using the translated shader");
+                    }
+                }
+                Err(error) => return Err(format!("{error:#}")),
+            }
+            if let Some(old) = old {
+                REFRESHED.fetch_add(1, Ordering::Relaxed);
+                if old != shader {
+                    CHANGED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            return Ok(shader);
+        }
+        let path = path.map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let ran = converter.ran.load(Ordering::Relaxed);
-            if !ran && made_by != source.as_bytes() {
+            if made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
-                if refresh && old.is_none() {
+                if usage.refresh() && old.is_none() {
                     // Translated again in its place; what came out before
                     // is what the new one is compared with.
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
@@ -259,19 +293,8 @@ fn cached_by(
                     tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
                 }
             }
-            if let Some(old) = old.take() {
-                REFRESHED.fetch_add(1, Ordering::Relaxed);
-                if old != shader {
-                    CHANGED.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            let (counter, what) = if ran {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -476,6 +499,8 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    const RUN: CacheUse = CacheUse::Run { refresh: false };
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -528,26 +553,52 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, RUN), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, RUN), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], container, translate, RUN), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH4 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, RUN), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, RUN), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail, false).is_err());
+        assert!(cached(&cache, &build, b"other", fail, RUN).is_err());
+    }
+
+    #[test]
+    fn a_run_keeps_its_shader_when_cache_publication_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"synthetic container with an obstructed destination";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let converter = Translate {
+            translate,
+            source: SOURCE,
+            shader: OnceLock::new(),
+        };
+        let key = victory_pipeline::CacheKey::new(&converter, &[&build[..], &container[..]].concat());
+        let path = cache.path_for(&key);
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(cached(&cache, &build, container, translate, RUN), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(cached(&cache, &build, container, translate, CacheUse::Precompile).is_err());
+        assert!(path.is_dir());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -594,20 +645,20 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(old())
         };
-        assert_eq!(cached_by(&cache, &build, "build a", container, first, false), Ok(old()));
+        assert_eq!(cached_by(&cache, &build, "build a", container, first, RUN), Ok(old()));
         let now = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
         let (stale, refreshed, changed) = stale_counts();
         // The next build, same version: the old translation, not translated.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, false), Ok(old()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, RUN), Ok(old()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         // Refreshing: translated again and kept.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, CacheUse::Precompile), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // Now the entry is this build's: served when refreshing too.
-        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, CacheUse::Precompile), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
