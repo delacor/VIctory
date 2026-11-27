@@ -36,6 +36,7 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         let plain = 0x20 + round as u8;
         let gpu_value = 0x90 + round as u8;
         let cpu_value = 0x60 + round as u8;
+        let conflict_value = 0xe0 + round as u8;
         // SAFETY: both complete title allocations are ours.
         unsafe {
             base.write_bytes(plain, SIDE);
@@ -56,7 +57,11 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         host.execute_own(&a);
         drop(upload); // the submitted list retains it
         // The CPU changes bytes beside those the GPU wrote.
-        unsafe { base.add(450).write_bytes(cpu_value, 32) };
+        unsafe {
+            base.add(450).write_bytes(cpu_value, 32);
+            // The CPU wins these bytes when both sides changed them.
+            base.add(160).write_bytes(conflict_value, 16);
+        };
         assert!(b.place_copy(dst + 96, src + 32, 640));
         assert!(recent_source(dst + 112, LEN));
         assert!(!recent_source(src + 16, 240));
@@ -82,6 +87,7 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         settle_now(WHY_SYNC);
         assert!(FINISHED.load(std::sync::atomic::Ordering::Acquire) >= number);
         let expected: Vec<_> = (48..48 + LEN).map(|i| match i {
+            160..176 => conflict_value,
             64..364 => gpu_value,
             450..482 => cpu_value,
             _ => plain,
@@ -100,5 +106,5 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
     }
     a.reset(); b.reset();
     assert_eq!(b.deferred().gpu_constants, 0);
-    eprintln!("GPU_CONSTANT_TEST 32 disjoint copies, GPU writes plus CPU changes, exact readback, caller release and fenced resets");
+    eprintln!("GPU_CONSTANT_TEST 32 disjoint copies, GPU writes plus CPU changes including conflicts, exact readback, caller release and fenced resets");
 }
