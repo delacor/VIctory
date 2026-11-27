@@ -91,6 +91,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A separate copy of one unaligned typed view, not the registered buffer.
+    exact_view: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -1784,6 +1786,11 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// The subset belonging to separate exact-view copies: snapshots, compared
+/// bytes and compared ranges. The existing title-buffer class includes these.
+#[cfg(feature = "diagnostics")]
+static EXACT_BACK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
@@ -1794,6 +1801,14 @@ pub(crate) fn back_line(frames: f64) {
         return;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
+    #[cfg(feature = "diagnostics")]
+    {
+        let own = EXACT_BACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "CPU writeback classification per frame: exact-view copies {:.1} MB snapshotted, {:.1} MB compared in {:.0} ranges; registered buffers {:.1} MB snapshotted, {:.1} MB compared",
+            mb(own[0]), mb(own[1]), own[2], mb((c[1] - own[0]).max(0.0)), mb((c[3] - own[1]).max(0.0)),
+        );
+    }
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
@@ -3218,6 +3233,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            exact_view: false,
             changes_only: Default::default(),
             mapped: false,
             place: None,
@@ -3308,6 +3324,10 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if self.exact_view {
+            EXACT_BACK[0].fetch_add(taken as u64, Ordering::Relaxed);
+        }
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -3455,6 +3475,11 @@ impl Shadow {
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if self.exact_view {
+            EXACT_BACK[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+            EXACT_BACK[2].fetch_add(1, Ordering::Relaxed);
+        }
         if !self.window && self.len >= 1 << 20 {
             BACK_CLASS[4].fetch_add((to - from) as u64, Ordering::Relaxed);
         }
@@ -5713,7 +5738,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.exact_view = true;
+    let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
