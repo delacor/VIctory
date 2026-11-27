@@ -447,3 +447,7 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
         device
     }
 }
+
+#[cfg(test)]
+#[path = "dxc/early_depth_tests.rs"]
+mod early_depth_tests;
