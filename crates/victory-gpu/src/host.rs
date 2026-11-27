@@ -334,6 +334,28 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     Ok(())
 }
 
+/// Name allocation attempts by their real call site; no scheduling changes.
+#[cfg(feature = "diagnostics")]
+fn buffer_allocation_caller(kind: &'static str, at: &'static std::panic::Location<'static>, bytes: u64) {
+    type Key = (&'static str, &'static str, u32);
+    static BY: Mutex<Option<std::collections::HashMap<Key, (u64, u64)>>> = Mutex::new(None);
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut by = BY.lock().unwrap_or_else(|e| e.into_inner());
+    let by = by.get_or_insert_with(Default::default);
+    let entry = by.entry((kind, at.file(), at.line())).or_default();
+    entry.0 += 1;
+    entry.1 += bytes;
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(20_000) {
+        let mut rows: Vec<_> = by.iter().collect();
+        rows.sort_by_key(|(_, value)| std::cmp::Reverse(value.0));
+        let rows: Vec<String> = rows.into_iter().take(12)
+            .map(|((kind,file,line),(n,bytes))| format!("{kind} {file}:{line} {n} attempts ({} MiB)", bytes >> 20))
+            .collect();
+        tracing::info!(count, "buffer allocation attempts by caller: {}", rows.join("; "));
+    }
+}
+
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -10570,7 +10592,10 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        #[cfg(feature = "diagnostics")]
+        buffer_allocation_caller("shared", std::panic::Location::caller(), size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10713,7 +10738,10 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        #[cfg(feature = "diagnostics")]
+        buffer_allocation_caller("uav", std::panic::Location::caller(), size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
