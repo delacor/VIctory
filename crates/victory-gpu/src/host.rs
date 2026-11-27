@@ -4170,6 +4170,8 @@ pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
+mod liststamps;
+#[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
@@ -6267,6 +6269,10 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // Optional stamps preserve the ordinary batched submission and relay.
+        #[cfg(feature = "diagnostics")]
+        let list_stamps = late && liststamps::on()
+            && liststamps::put(&mut lists, &marks, &mut firsts).is_some();
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
@@ -6287,6 +6293,10 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            #[cfg(feature = "diagnostics")]
+            if list_stamps {
+                liststamps::sent(*submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -9859,6 +9869,8 @@ impl Meter {
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
+            #[cfg(feature = "diagnostics")]
+            liststamps::line(frames);
             crate::shadow::back_line(frames);
             #[cfg(feature = "diagnostics")]
             split_line(frames);
