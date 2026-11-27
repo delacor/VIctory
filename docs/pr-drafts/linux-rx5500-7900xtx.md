@@ -180,18 +180,16 @@ native before/after reservation regression and related loader tests pass. See
 [the separate profiler draft](linux-profiler-stack.md); it makes no FPS claim.
 
 The later snapshot SIMD and mapping-barrier batching trials also show no
-measurable gain and remain out of the accepted build. CPU-budget heap pooling
-has passed actual-GPU allocation/readback and budget-reset checks but still
-needs a replay. The 16-MiB placement-threshold replay and complete half-buffer
-PR port are under evaluation; neither supports a new performance or visual
-correctness claim. The investigation ledger contains exact scope and results.
+measurable gain and remain out of the accepted build. CPU-budget heap pooling passes its allocation/readback and reset checks, but
+its factorial replay is flat, as are range sweeps and the 16-MiB placement
+threshold. These candidates remain outside the accepted changes. The investigation ledger contains exact scope and results.
 
 The complete final half-buffer correction from fxceless #927 is now retained
 (9a2b5454a), with actual GPU readback of all 65,536 bit patterns. Its six-minute
 replay still has missing body/scenery, so it supports no full-intro fix or new
 FPS claim. The newer relay ordering PR Belobug #428 is next: both numerical GPU
-ordering regressions pass with the old repair checker off, but its game replay
-is still pending. Coordinate follow-ups with those existing PRs and preserve
+ordering regressions pass with the old repair checker off, and its subsequent
+game replay completes without restoring the missing opaque surfaces. Coordinate follow-ups with those existing PRs and preserve
 their authorship; these are attributed imports, not new submissions of our own.
 
 The relay ordering correction is retained after its GPU checks and six-minute
@@ -201,3 +199,12 @@ single-frame target dump. That dump shows room/scenery in the G-buffers that
 the final image loses, so the current visual investigation targets lighting,
 depth and composition. No source PR should include the private target images,
 native shaders, operation logs or executable.
+
+
+The later factorial replay does not show a useful gain from budget pooling or
+range indexing. Streaming copies, new parallel reads and upload-ahead race
+changes remain isolated experiments pending their respective replay or
+qualification. Disabling upload-ahead and enabling the existing ambient-air
+correction each leave the missing opaque scenery unchanged. The current
+accepted build remains below the 20-FPS target; do not describe this draft
+as a complete performance or rendering fix.

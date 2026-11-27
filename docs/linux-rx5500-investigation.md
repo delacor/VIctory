@@ -946,7 +946,7 @@ and both actual-GPU ordering regressions pass locally. With FETCH_CHECK=0,
 the 12-round regression reports zero wrong title results, zero undone GPU
 results and zero repaired/suspect pieces. The unchanged unsafe path was not
 replayed locally just to provoke a race. The Windows workspace check passes;
-application build and game replay are still pending at this update.
+application build and game replay subsequently passed; see the following replay entry.
 
 Range PRs Belobug #440/#437 are preserved as 88d17d8c4/ab52b7e03 with a
 default-off measured gate dbb3e63ee on perf20/range-sweeps-20261127. Their
@@ -1005,13 +1005,64 @@ bytes after losing allocations are dropped. Follow-up d8b2c557c keeps imported
 window creation/publication under the same exclusion lock as in_place_let_go;
 only ordinary copied-window allocation moves outside it. This prevents a remap
 from removing an entry just before an unlocked creator republishes its old
-imported mapping. These changes are not yet compiled or benchmarked.
+imported mapping. These changes subsequently pass the combined checks; the following factorial replay does not establish a useful performance gain.
 
 The combined experimental branch perf20/copy-performance-20261127 contains
 the candidate budget pool, range algorithms and cache-lock adaptation on the
 accepted correctness base, with the capture and test-compiler fixes. Pool and
-range gates remain off by default. Its new combination has not been qualified
-and must not replace the accepted/runtime build yet. The range comparison
+range gates remain off by default. Its combined checks subsequently pass; the following factorial replay remains flat, so it does not replace the accepted build. The range comparison
 also restores the true original empty-range scan on its off side: the imported
 pairwise helper already had an early exit, which otherwise silently improves
 both sides and hides part of the PR's gain.
+
+
+## Rejected performance trials and refreshed PR review (04:03 UTC)
+
+The all-pages inventory refresh at 03:44 UTC covers 3,156 open PRs across all
+eight known repositories, without pagination errors or duplicate records.
+There are 48 new/changed heads since the 02:42 inventory. This is metadata
+coverage, not a claim to have reviewed the code of every PR. Sanitized inventory
+and changes are in the local performance report; private runtime artifacts stay
+outside source history.
+
+The combined copy-performance candidate 8174bf246 passes the Windows workspace
+and application build, eight targeted test groups, and both relay GPU ordering
+regressions. Replay 033144 runs 361.5 seconds in 3D without a fatal diagnostic.
+In the warm completed factorial phases, neither budget pooling nor range sweeps
+helps: approximately 5.97 FPS with both off, 5.92 with budget only, 5.84 with
+range only and 5.91 with both. Cache concurrency is enabled on every side, so
+its effect is not isolated. The budget pool is exercised; no large range-index
+path usage appears in the logs. Keep all three out of the accepted changes.
+The same incomplete opaque scenery remains.
+
+The ambient-air diagnostic 031926 completes 180.9 seconds with the existing
+air correction set to 0.25. It does not restore the missing opaque surfaces;
+the early frontal shot is darker. The frontal body was visible in the control
+too, so its brief appearance is not evidence of a fix. Restore AIR to zero/unset.
+
+The complete 7900XTX #98 streaming-copy series is preserved on the separate
+streaming-copy branch, including its final default-off switches STREAM_COPY and
+STREAM_REFRESH. Windows workspace/all-target checks, application build, protected
+copy/guard-page checks and wide-copy checks pass. A broad host-test filter gives
+51 passes and one failure: the root-flag rejection fixture. That exact fixture
+also fails on the older fetchguard baseline because the private vkd3d serializer
+accepts the artificial flag. The qualified broad run excluding that known fixture
+passes 51 tests. Several native mesh tests skip on this GPU; this does not establish
+native mesh support. No streaming-copy performance benefit is established yet.
+
+New Belobug #454 addresses upload-ahead claim/publication races, failed-job
+callbacks and pool-epoch flips. It is isolated for validation, with authorship
+preserved. Its inherited one-second list timeout still needs scrutiny. Control
+replay 035448 disables UPLOAD_AHEAD on the same diagnostic executable, runs
+180 seconds, and leaves the same hair/sky/checkerboard result. Thus these races
+are worth correcting but do not explain the entire visual failure.
+The same-source plain release build passes workspace checks and is now being
+replayed with upload-ahead and both streaming switches off. Its LTO/codegen
+settings differ from the diagnostic profile; its frame meter remains available,
+but diagnostic frame captures do not.
+
+The new fxceless #1424 descriptor-page parallelism already exists in this fork.
+Only its single-large-copy splitting is being adapted, default off, with the
+existing protected read and sparse/remap fallback retained. New regression cases
+cover unaligned ends, partial failed chunks, remaps and exclusion of nested pool
+submission/title destinations. Compilation and replay are pending.
