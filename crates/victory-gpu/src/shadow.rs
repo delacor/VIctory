@@ -92,6 +92,7 @@ pub(crate) struct Shadow {
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// A separate copy of one unaligned typed view, not the registered buffer.
+    #[cfg(feature = "diagnostics")]
     exact_view: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
@@ -3233,6 +3234,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            #[cfg(feature = "diagnostics")]
             exact_view: false,
             changes_only: Default::default(),
             mapped: false,
@@ -5739,7 +5741,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, address, len);
-    shadow.exact_view = true;
+    #[cfg(feature = "diagnostics")]
+    { shadow.exact_view = true; }
     let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
