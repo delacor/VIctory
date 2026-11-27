@@ -7,6 +7,8 @@
 //! It needs no title files: the draws are tiny triangles of ours.
 
 use super::*;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
