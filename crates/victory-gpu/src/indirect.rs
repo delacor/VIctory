@@ -33,10 +33,6 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-#[cfg(test)]
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-#[cfg(test)]
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 #[cfg(test)]
 use windows::core::s;
@@ -817,38 +813,22 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        // Use the same Wine fallback as production: the system compiler
+        // can reject ByteAddressBuffer methods or omit the root signature.
+        let bytes = crate::dxc::compile(source, "main", "cs_5_1")?;
+        let root = crate::rootstring::make(device, source)?;
+        // SAFETY: the compiled bytes and root outlive pipeline creation.
+        let pso = unsafe {
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
                     pShaderBytecode: bytes.as_ptr().cast(),
                     BytecodeLength: bytes.len(),
                 },
                 ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
-        }
+            })?
+        };
+        Ok(Clamp { root, pso })
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
