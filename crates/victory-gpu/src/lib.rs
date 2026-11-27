@@ -70,6 +70,8 @@ mod land;
 mod mesh_indirect;
 #[cfg(windows)]
 mod mesh_barriers;
+#[cfg(windows)]
+mod mesh_shared;
 pub mod list;
 pub mod object;
 pub mod pipeline;

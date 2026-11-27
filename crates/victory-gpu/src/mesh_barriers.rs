@@ -78,6 +78,7 @@ impl<'a> MeshBarriers<'a> {
             #[cfg(not(feature = "diagnostics"))]
             let recording = false;
             asked
+                && !crate::mesh_shared::enabled()
                 && !capture
                 && !recording
                 && crate::host::host().is_some_and(|h| supported(&h.device))

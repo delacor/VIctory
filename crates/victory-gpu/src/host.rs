@@ -2504,7 +2504,7 @@ fn small_mesh_chunks() -> bool {
 
 /// Bytes retained by the mesh pools, including free and delayed chunks.
 pub(crate) fn mesh_scratch_bytes() -> u64 {
-    MESH_CHUNK_BYTES.load(Ordering::Relaxed)
+    MESH_CHUNK_BYTES.load(Ordering::Relaxed) + crate::mesh_shared::bytes()
 }
 
 /// Mesh fallback chunks no list holds, in COMMON, by size. A list takes
@@ -7741,17 +7741,18 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
-    /// A shader-writable buffer of at least `len` bytes for one mesh fallback
-    /// draw, in COMMON state; the draw leaves it so. Each draw of the list
-    /// gets its own buffer until the list is reset, so a draw's transitions
-    /// never touch another's data.
-    // shortcut: one buffer per draw (grown, never shared); a pool sliced by
-    // offset with UAV barriers would take less memory.
+    /// Shader-writable storage for a mesh fallback draw. Private pools recycle
+    /// after each draw; VICTORY_MESH_SHARED=1 shares output storage across
+    /// lists on the ordered DIRECT queue. Commands retain their private pool.
+    /// Every caller keeps the buffer until completion and ends its use in UAV.
     pub(crate) fn mesh_scratch(
         &self,
         pool: ScratchPool,
         len: u64,
     ) -> Option<ScratchRegion> {
+        if pool == ScratchPool::Data && crate::mesh_shared::enabled() {
+            return crate::mesh_shared::region(len);
+        }
         let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
         s.pools[pool as usize].region(len, |size| {
             // A free chunk of that size (chunk sizes are powers of two from
