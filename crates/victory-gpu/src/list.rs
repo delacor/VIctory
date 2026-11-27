@@ -275,6 +275,26 @@ fn pool_event(which: usize) {
     let _ = which;
 }
 
+#[cfg(windows)]
+fn pool_on_create() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") { return on; }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+#[track_caller]
+fn new_host_list() -> Option<crate::host::HostList> {
+    match crate::host::host()?.new_list() {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    }
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -289,7 +309,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => { pool_event(0); Some(list) },
-        None => { pool_event(1); crate::host::host().and_then(|h| h.new_list().ok()) },
+        None => { pool_event(1); new_host_list() },
     }
 }
 
@@ -639,13 +659,10 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        // Thin replay materialization also creates this box. Taking a list
+        // already reset after GPU completion preserves its private budget
+        // and allocators instead of bypassing the idle pool every replay.
+        host: if thin { None } else if pool_on_create() { fresh_list() } else { new_host_list() },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();

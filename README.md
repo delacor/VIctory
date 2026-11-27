@@ -210,3 +210,10 @@ reuses the same placed write-back allocator as exact-view buffers. It is off
 by default. Resources remain held by their list until completed work permits
 reset; allocation failure falls back to the committed-buffer path. This
 adapts the upload-reuse idea of 7900XTX PR #433 to the existing placed allocator.
+
+
+Replay-list materialization uses the completed host-list pool, as list reset
+and split paths already do. Reused lists were reset after GPU completion and
+start with fresh draw state. `VICTORY_LIST_CREATE_POOL=0` selects the old
+creation path for comparison; `VICTORY_AB=20,VICTORY_LIST_CREATE_POOL` alternates
+the two in a diagnostics build. Pool count/byte limits remain in effect.
