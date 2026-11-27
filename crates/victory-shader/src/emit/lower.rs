@@ -5307,7 +5307,8 @@ impl<'a> Lower<'a> {
             if self.s.mesh_as_compute {
                 self.mesh_out_store(MESH_INDICES, index, &[z, z, z]);
                 if self.s.prims.is_empty() && mesh_export_probe() {
-                    self.mesh_out_store(MESH_PRIMITIVES, index, &[z, z, z, z]);
+                    let marker = self.s.m.i32(64);
+                    self.mesh_out_store(MESH_PRIMITIVES, index, &[z, z, marker, index]);
                 }
             } else {
                 self.s.op(

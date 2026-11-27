@@ -561,6 +561,12 @@ fn run_compute(
 fn run_compute_all(
     host: &Host, cs: &HostShader, layout: &MeshLayout, groups: u32,
 ) -> Result<[Vec<u32>; 3], String> {
+    run_compute_mode(host, cs, layout, groups, false)
+}
+
+fn run_compute_mode(
+    host: &Host, cs: &HostShader, layout: &MeshLayout, groups: u32, indirect: bool,
+) -> Result<[Vec<u32>; 3], String> {
     let gpu = Gpu::new(host)?;
     let pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
     let outs = gpu.mesh_buffers(layout, groups)?;
@@ -577,7 +583,45 @@ fn run_compute_all(
         })
         .collect::<Result<_, _>>()?;
     let (_alloc, list) = gpu.list()?;
-    gpu.record_compute(&list, &pso, &outs, groups);
+    // Keep the argument resource and signature until the submitted work finishes.
+    let _indirect = if indirect {
+        let uav = |index| D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                UnorderedAccessView: D3D12_INDIRECT_ARGUMENT_DESC_0_4 {
+                    RootParameterIndex: index,
+                },
+            },
+        };
+        let entries = [uav(0), uav(1), uav(2), D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default()
+        }];
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 40, NumArgumentDescs: 4, pArgumentDescs: entries.as_ptr(), NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        let arguments = gpu.buffer(D3D12_HEAP_TYPE_UPLOAD, 40,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut bytes = Vec::new();
+        // SAFETY: the resources and argument descriptions remain live.
+        unsafe {
+            for out in &outs { bytes.extend(out.GetGPUVirtualAddress().to_le_bytes()); }
+            for word in [groups, 1, 1, 0] { bytes.extend(word.to_le_bytes()); }
+            let mut mapped = std::ptr::null_mut();
+            arguments.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped)).map_err(err)?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            arguments.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 40 }));
+            gpu.dev.CreateCommandSignature(&desc, &gpu.root, &mut signature).map_err(err)?;
+            let signature = signature.ok_or("no indirect signature")?;
+            list.SetPipelineState(&pso);
+            list.SetComputeRootSignature(&gpu.root);
+            list.ExecuteIndirect(&signature, 1, &arguments, 0, None, 0);
+            Some((signature, arguments))
+        }
+    } else {
+        gpu.record_compute(&list, &pso, &outs, groups);
+        None
+    };
     // SAFETY: plain D3D12 recording of live resources.
     unsafe {
         for (out, readback) in outs.iter().zip(&readbacks) {
@@ -994,4 +1038,39 @@ fn mesh_export_probe_reports_raw_culling_and_preserves_indices() {
     });
     assert!(!lower::mesh_export_probe());
     assert_eq!(lowered(true).1.primitive_dwords, 0);
+}
+
+
+/// Exercise the same three root-UAV updates plus dispatch as the game's
+/// indirect fallback, rather than validating its conversion bytes alone.
+#[test]
+fn indirect_mesh_compute_executes_and_matches_direct_output() {
+    let host = Host::new(false).expect("a hardware SM 6.6 device");
+    lower::with_mesh_export_probe(true, || {
+        let (cs, layout) = lowered(true);
+        let direct = run_compute_mode(&host, &cs, &layout, 2, false).unwrap();
+        let indirect = run_compute_mode(&host, &cs, &layout, 2, true).unwrap();
+        assert_eq!(indirect, direct);
+        assert!(indirect[2].chunks_exact(4).any(|r| r[2] == 256));
+    });
+}
+
+/// An entry marker differentiates a dispatched mesh with no primitive
+/// exports from an output buffer no compute dispatch touched.
+#[test]
+fn mesh_export_probe_marks_dispatches_even_without_exports() {
+    let host = Host::new(false).expect("a hardware SM 6.6 device");
+    lower::with_mesh_export_probe(true, || {
+        let mut native = program(false);
+        let mut words: Vec<u32> = native.code.chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let at = words.iter().position(|&w| w == 0xF800_0941).expect("primitive export");
+        words.drain(at..at+2);
+        native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (cs, layout) = lowered_native(true, false, native);
+        let [_, indices, records] = run_compute_mode(&host, &cs, &layout, 2, true).unwrap();
+        assert!(indices.iter().all(|&i| i == 0));
+        let expected: Vec<u32> = (0..2).flat_map(|_| (0u32..3).flat_map(|lane| [0,0,64,lane])).collect();
+        assert_eq!(records, expected);
+    });
 }
