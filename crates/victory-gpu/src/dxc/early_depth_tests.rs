@@ -42,12 +42,25 @@ fn native_early_depth_survives_translation_and_depth_exports_remain_late() {
         eprintln!("DXC unavailable; early-depth metadata test skipped");
         return;
     };
-    let container = Container::parse(&carrier).unwrap();
     for (control, expected) in [(0, false), (1 << 12, true), (1 << 12 | 1, false)] {
-        let words: [u32; 7] = [
-            0x7e00_02f2, 0x7e02_0280, 0x7e04_0280, 0x7e06_02f2,
-            0xf800_180f, 0x0302_0100, 0xbf81_0000,
+        let depth = control & 1 != 0;
+        let depth_carrier;
+        let carrier = if depth {
+            depth_carrier = dxc(
+                "void main(out float4 c : SV_Target, out float z : SV_Depth) { c=float4(1,0,0,1); z=1; }",
+                "main", "ps_6_0",
+            ).unwrap();
+            &depth_carrier
+        } else { &carrier };
+        let container = Container::parse(carrier).unwrap();
+        let mut words = vec![
+            0x7e00_02f2u32, 0x7e02_0280, 0x7e04_0280, 0x7e06_02f2,
+            if depth { 0xf800_100f } else { 0xf800_180f }, 0x0302_0100,
         ];
+        if depth {
+            words.extend([0xf800_1881, 0]); // exp mrtz v0, off, off, off done vm
+        }
+        words.push(0xbf81_0000);
         let native = NativeProgram {
             stage: HwStage::Ps, wave64: false, vgprs: 4, layout: vec![], used: vec![],
             io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: control, patches: vec![] },
