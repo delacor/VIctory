@@ -903,7 +903,8 @@ impl HostPipeline {
                     inputs,
                     expanded: f.expanded,
                     signatures,
-                    window_readonly: shaders.iter().all(|s| super::mesh_window_readonly(&s.container)),
+                    window_readonly: shaders.iter().all(|s| s.ambient.is_none() && s.probe.is_none()
+                        && super::mesh_window_readonly(&s.container)),
                 }),
                 pso,
                 root,

@@ -434,25 +434,21 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
 #[cfg(windows)]
 pub(crate) fn mesh_window_readonly(container: &[u8]) -> bool {
     use victory_shader::gfx10::{Encoding, Fields, decode};
-    let Ok(c) = victory_shader::dxbc::Container::parse(container) else { return false };
-    let mut found = false;
-    for part in c.parts.iter().filter(|part| part.fourcc == victory_shader::dxbc::FourCC(*b"DXIL")) {
-        let Ok(programs) = victory_shader::native_programs(part.data) else { return false };
-        if programs.is_empty() { return false; }
-        for p in programs {
-            found = true;
-            if stores(&p) { return false; }
-            let Ok(code) = decode(&p.code) else { return false };
-            if !code.iter().all(|i| {
-                let Some(name) = i.name() else { return false };
-                !matches!(i.encoding, Encoding::Mimg)
-                    && !matches!(i.fields(p.wave64), Fields::Ds { gds: true, .. })
-                    && !name.contains("memtime") && !name.contains("realtime")
-                    && !name.contains("trap")
-            }) { return false; }
-        }
-    }
-    found
+    let Ok(c) = victory_shader::Container::parse(container) else { return false };
+    let Some(part) = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))
+        else { return false };
+    let Ok(programs) = victory_shader::native_programs(part.data) else { return false };
+    !programs.is_empty() && programs.iter().all(|p| {
+        if stores(p) { return false; }
+        let Ok(code) = decode(&p.code) else { return false };
+        code.iter().all(|i| {
+            let Some(name) = i.name() else { return false };
+            !matches!(i.encoding, Encoding::Mimg)
+                && !matches!(i.fields(p.wave64), Fields::Ds { gds: true, .. })
+                && !name.contains("memtime") && !name.contains("realtime")
+                && !name.contains("trap")
+        })
+    })
 }
 
 /// Whether a console program can store to memory through raw addresses

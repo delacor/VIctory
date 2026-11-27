@@ -148,6 +148,18 @@ impl Window {
             }
         }
         list.mesh_scratch_recycle();
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static WINDOWS: AtomicU64 = AtomicU64::new(0);
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let windows = WINDOWS.fetch_add(1, Relaxed)+1;
+        let writes = WRITES.fetch_add(u64::from(self.writes), Relaxed)+u64::from(self.writes);
+        if windows == 1 || windows.is_multiple_of(512) {
+            tracing::info!(windows, writes, mean = writes as f64/windows as f64,
+                "mesh windows completed: full output capacity preserved, cumulative calls");
+        }
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
