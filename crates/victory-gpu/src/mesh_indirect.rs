@@ -60,8 +60,12 @@ void main() {
     for (uint i = 0; i < records; i++) {
         // Portable dispatch/draw pairs finish using the output before the
         // next record reuses it. Their root descriptors stay fixed.
-        if (portable != 0) used = 0;
+        if ((portable & 1u) != 0) used = 0;
         uint g = i < n ? args.Load(i * stride) : 0u;
+        // Optional capture metadata lives in command padding, never in
+        // arguments consumed by either command signature. Preserve the
+        // post-count, pre-capacity value to distinguish culling from overflow.
+        uint requested = g;
         if (g > capacity - used) {
             g = 0;
         }
@@ -70,6 +74,7 @@ void main() {
         commands.Store2(c + 8, at(indices, used * primitives * 12));
         commands.Store2(c + 16, at(prims, used * prim_bytes));
         commands.Store3(c + 24, uint3(g, 1, 1));
+        if ((portable & 2u) != 0) commands.Store(c + 36, requested);
         uint first = used * primitives * 3;
         uint d = draws + i * (expanded != 0 ? 24 : 32);
         commands.Store2(d, at(vertices, used * vertex_bytes));

@@ -378,3 +378,41 @@ void main(uint3 group : SV_GroupID) {
         }
     }
 }
+
+/// Capture metadata distinguishes zero/count masking from a capacity drop,
+/// without changing the dispatch/draw arguments or portable reuse semantics.
+#[test]
+fn captured_pre_capacity_counts_do_not_change_gpu_commands() {
+    let device = device().expect("a D3D12 device for GPU command readback");
+    let args = [0,1,1, 2,1,1, 2,1,1, 5,1,1];
+    let records = 4;
+    let draws = 256;
+    for expanded in [false, true] {
+        let layout = layout(if expanded { 4 } else { 0 });
+        let regions = Regions { capacity: 3, ..regions(&layout) };
+        for portable in [false, true] {
+            for count in [None, Some(2)] {
+                let execute = |capture: bool| run(&device, &args, (records,12), count, |_| {
+                    let mut p = plan((records,12,count.is_some()), &layout, &regions,
+                        expanded, 0x1_0000_0000, draws);
+                    p[15] = u32::from(portable) | (u32::from(capture) << 1);
+                    p
+                }, ((draws + records * draw_stride(expanded)) / 4) as usize);
+                let normal = execute(false);
+                let captured = execute(true);
+                let requested = if count.is_some() { [0,2,0,0] } else { [0,2,2,5] };
+                let dispatched = if count.is_some() || !portable { [0,2,0,0] } else { [0,2,2,0] };
+                for i in 0..records as usize {
+                    let c = i * 10;
+                    assert_eq!(captured[c+9], requested[i], "raw record {i}");
+                    assert_eq!(&normal[c..c+9], &captured[c..c+9], "dispatch record {i}");
+                    assert_eq!(captured[c+6], dispatched[i], "effective record {i}");
+                    let d = (draws / 4) as usize + i * (draw_stride(expanded) / 4) as usize;
+                    let fields = if expanded { 6 } else { 7 };
+                    assert_eq!(&normal[d..d+fields], &captured[d..d+fields], "draw record {i}");
+                    assert_eq!(captured[d+2], 96 * dispatched[i], "indices record {i}");
+                }
+            }
+        }
+    }
+}

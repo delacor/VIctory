@@ -3434,6 +3434,13 @@ impl State {
         );
         plan[15] = u32::from(signatures.portable);
         #[cfg(feature = "diagnostics")]
+        {
+            static RAW_COUNTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *RAW_COUNTS.get_or_init(|| std::env::var_os("VICTORY_MESH_CAPTURE").is_some()) {
+                plan[15] |= 2; // Preserve pre-capacity counts in unused padding.
+            }
+        }
+        #[cfg(feature = "diagnostics")]
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
         #[cfg(feature = "diagnostics")]
         let argument = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
