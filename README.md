@@ -203,3 +203,10 @@ For comparison on implementations with functional state-changing indirect
 commands, `VICTORY_MESH_INDIRECT_STATEFUL=1` selects the earlier batched path.
 The portable path is the default. This concerns the software mesh fallback;
 hardware mesh shaders continue to use their existing path.
+
+
+For list upload buffers that card steps may fill, `VICTORY_UPLOAD_POOL=1`
+reuses the same placed write-back allocator as exact-view buffers. It is off
+by default. Resources remain held by their list until completed work permits
+reset; allocation failure falls back to the committed-buffer path. This
+adapts the upload-reuse idea of 7900XTX PR #433 to the existing placed allocator.

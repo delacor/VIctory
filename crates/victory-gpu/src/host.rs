@@ -2698,6 +2698,15 @@ impl Drop for Deferred {
     }
 }
 
+/// Reuse the qualified write-back placed allocator for list uploads.
+/// The fallback allocation and list ownership remain the same.
+fn upload_placed() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_POOL") { return on; }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1"))
+}
+
 /// Whether a queue's submissions go to the card without a wait for each
 /// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
 /// waits for every list on its own).
@@ -7626,8 +7635,18 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        self.upload_for_steps(host, size, card_steps::stage() > 1, upload_placed())
+    }
+
+    fn upload_for_steps(&self, host: &Host, size: u64, shared: bool, pooled: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        // The existing deferred hold keeps both committed and placed resources
+        // alive until reset, after the list's last submission has completed.
+        let (buffer, data) = if shared {
+            (if pooled { crate::pool::view_buffer(host, size) } else { None })
+                .or_else(|| host.shared_buffer(size))?
+        } else {
+            host.upload_buffer(size)?
+        };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -12042,3 +12061,7 @@ mod mesh_scratch {
     }
 
 }
+
+
+#[cfg(test)]
+mod upload_placed_tests;
