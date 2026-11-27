@@ -190,7 +190,10 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
 }
 
 fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
-    let native = program(prims);
+    lowered_native(as_compute, prims, program(prims))
+}
+
+fn lowered_native(as_compute: bool, prims: bool, native: NativeProgram) -> (HostShader, MeshLayout) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -616,6 +619,32 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Edge flags belong to rasterization, not the nine-bit vertex indices.
+/// Exercise each edge flag and their combinations on actual generated GPU
+/// indices, keeping the deliberately culled primitives and second group.
+#[test]
+fn primitive_edge_flags_do_not_cull_valid_mesh_triangles() {
+    let host = Host::new(false).expect("a hardware SM 6.6 device for mesh output readback");
+    for prims in [false, true] {
+        for edges in 0u32..8 {
+            let mut native = program(prims);
+            let mut words: Vec<u32> = native.code.chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+            let export = exp(20, [Some(6), None, None, None], true)[0];
+            let at = words.iter().position(|&w| w == export).unwrap();
+            let flags = ((edges & 1) << 9) | ((edges & 2) << 18) | ((edges & 4) << 27);
+            // v_or_b32 v6, literal, v6: add only edge flags. The two
+            // intentionally culled lanes retain bit31.
+            words.splice(at..at, [vop2(0x1c, 6, LITERAL, 6), flags]);
+            native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let (cs, layout) = lowered_native(true, prims, native);
+            let [_, indices] = run_compute(&host, &cs, &layout, 2).unwrap();
+            assert_eq!(indices, [0,1,2, 0,0,0, 0,0,0, 3,4,5, 0,0,0, 0,0,0],
+                "edge flags {edges:03b}, per-primitive outputs {prims}");
+        }
+    }
 }
 
 /// How [`render`] draws the program.
