@@ -8,6 +8,7 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
     };
     assert!(on(), "set VICTORY_GPU_CONSTANTS=1");
+    let reference = std::env::var_os("GPU_CONSTANT_REFERENCE").is_some();
     let host = host().expect("hardware D3D12 host");
     const SIDE: usize = 1 << 16;
     const LEN: usize = 512;
@@ -56,7 +57,20 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         a.close();
         host.execute_own(&a);
         drop(upload); // the submitted list retains it
-        // The CPU changes bytes beside those the GPU wrote.
+        // The overlap case needs an actual order, not racing CPU and GPU
+        // writes with an arbitrary expected winner. Wait for the GPU write
+        // itself (without asking VIctory to settle/merge its flight), then
+        // make the CPU overwrite. The unchanged production path also failed
+        // the previous unordered fixture.
+        unsafe {
+            let completed: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue().Signal(&completed, 1).unwrap();
+            while completed.GetCompletedValue() < 1 {
+                host.device.GetDeviceRemovedReason().unwrap();
+                std::thread::yield_now();
+            }
+        }
+        // The CPU changes bytes beside and after those the GPU wrote.
         unsafe {
             base.add(450).write_bytes(cpu_value, 32);
             // The CPU wins these bytes when both sides changed them.
@@ -68,20 +82,29 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
         let back = host.read_back_buffer((MOST * LEN) as u64).unwrap();
         let mut addresses = BTreeSet::new();
         for i in 0..MOST {
-            let (buffer, gpu) = b.constant_from_gpu((dst + 112) as u64, LEN as u64)
-                .expect("recent placed bytes should use the GPU constant path");
+            let (buffer, gpu) = if reference {
+                let (buffer, gpu, mapped) = b.scratch_held(LEN as u64).unwrap();
+                b.defer_fill_buffer(&buffer, mapped, (dst + 112) as *const u8, LEN);
+                (buffer, gpu)
+            } else {
+                b.constant_from_gpu((dst + 112) as u64, LEN as u64)
+                    .expect("recent placed bytes should use the GPU constant path")
+            };
             assert_eq!(gpu % 256, 0);
             assert!(addresses.insert(gpu), "each recorded copy owns a disjoint buffer");
             unsafe {
-                b.list.ResourceBarrier(&[transition(&buffer, readable, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                b.list.CopyBufferRegion(&back, (i * LEN) as u64, &buffer, 0, LEN as u64);
+                if !reference { b.list.ResourceBarrier(&[transition(&buffer, readable, D3D12_RESOURCE_STATE_COPY_SOURCE)]); }
+                let offset = gpu - buffer.GetGPUVirtualAddress();
+                b.list.CopyBufferRegion(&back, (i * LEN) as u64, &buffer, offset, LEN as u64);
             }
             drop(buffer); // keep() must preserve it until completion
         }
+        if !reference {
         assert!(b.constant_from_gpu((dst + 112) as u64, LEN as u64).is_none(),
             "the per-recording allocation cap must preserve the CPU fallback");
         assert!(b.deferred().copies.iter().all(|step| !matches!(step, Step::Fill(..))),
             "the copy chain must add no CPU fill that reads the placed destination");
+        }
         b.close();
         let number = host.execute_own(&b);
         settle_now(WHY_SYNC);
@@ -106,5 +129,6 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
     }
     a.reset(); b.reset();
     assert_eq!(b.deferred().gpu_constants, 0);
+    eprintln!("reference_cpu_fill={reference}");
     eprintln!("GPU_CONSTANT_TEST 32 disjoint copies, GPU writes plus CPU changes including conflicts, exact readback, caller release and fenced resets");
 }
