@@ -3424,7 +3424,7 @@ impl State {
         let l = &list.list;
         let base = unsafe { data.buffer.GetGPUVirtualAddress() } + data.offset;
         let commands_gpu = unsafe { commands.buffer.GetGPUVirtualAddress() } + commands.offset;
-        let plan = crate::mesh_indirect::plan(
+        let mut plan = crate::mesh_indirect::plan(
             (records, stride, count.is_some()),
             &f.layout,
             &regions,
@@ -3432,6 +3432,7 @@ impl State {
             base,
             draws32,
         );
+        plan[15] = u32::from(signatures.portable);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
         let (common, uav, argument) = (
             D3D12_RESOURCE_STATE_COMMON,
@@ -3449,59 +3450,75 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let mut drawn = false;
-        if self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
-            unsafe {
-                #[cfg(feature = "diagnostics")]
-                list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
-                l.ExecuteIndirect(&signatures.compute, records, &commands.buffer, commands.offset, None, 0);
-                l.ResourceBarrier(&[transition(&data.buffer, uav, read)]);
-            }
-            #[cfg(feature = "diagnostics")]
-            {
-                static MESH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-                let selected = MESH.get_or_init(|| std::env::var("VICTORY_MESH_CAPTURE").ok()
-                    .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())));
-                if let Some(hash) = selected
-                    && p.stages.first().is_some_and(|s| s.shader.hash == *hash)
-                {
-                    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
-                    let vertices = f.layout.bytes(16);
-                    let triangles = f.layout.bytes(128);
-                    let ranges = [
-                        (data.offset, vertices[0].min(regions.indices)),
-                        (data.offset + regions.indices, triangles[1].min(regions.index_bytes)),
-                        (data.offset + regions.prims, triangles[2].min(regions.bytes - regions.prims)),
-                    ];
-                    list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}-attempt{attempt}"));
-                    let ranges = [
-                        (commands.offset, u64::from(records.min(32)) * u64::from(COMPUTE_STRIDE)),
-                        (commands.offset + draws, u64::from(records.min(32)) * u64::from(draw_stride(f.expanded))),
-                    ];
-                    list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}-attempt{attempt}"));
-                }
-            }
-            drawn = self.prepare_for(list, false, true);
-            if drawn {
+        // Portable records reuse one output region. Complete each compute
+        // and raster pair before a later record can overwrite that output.
+        for record in 0..(if signatures.portable { records } else { 1 }) {
+            if self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
                 unsafe {
-                    for (param, at) in f.inputs.into_iter().zip([0, regions.indices, regions.prims]) {
-                        l.SetGraphicsRootShaderResourceView(param, base + at);
-                    }
-                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
-                    if !f.expanded {
-                        l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                            BufferLocation: base + regions.indices,
-                            SizeInBytes: index_bytes,
-                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                        }));
-                    }
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
-                    l.ExecuteIndirect(&signatures.draw, records, &commands.buffer, commands.offset + draws, None, 0);
+                    list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
+                    if signatures.portable {
+                        for (param, at) in f.outputs.into_iter().zip([0, regions.indices, regions.prims]) {
+                            l.SetComputeRootUnorderedAccessView(param, base + at);
+                        }
+                    }
+                    let offset = if signatures.portable { u64::from(record) * u64::from(COMPUTE_STRIDE) + 24 } else { 0 };
+                    l.ExecuteIndirect(&signatures.compute, if signatures.portable { 1 } else { records },
+                        &commands.buffer, commands.offset + offset, None, 0);
+                    l.ResourceBarrier(&[transition(&data.buffer, uav, read)]);
                 }
-                self.set_topology(list, self.topology);
+                #[cfg(feature = "diagnostics")]
+                {
+                    static MESH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                    let selected = MESH.get_or_init(|| std::env::var("VICTORY_MESH_CAPTURE").ok()
+                        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())));
+                    if let Some(hash) = selected
+                        && p.stages.first().is_some_and(|s| s.shader.hash == *hash)
+                    {
+                        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+                        let vertices = f.layout.bytes(16);
+                        let triangles = f.layout.bytes(128);
+                        let ranges = [
+                            (data.offset, vertices[0].min(regions.indices)),
+                            (data.offset + regions.indices, triangles[1].min(regions.index_bytes)),
+                            (data.offset + regions.prims, triangles[2].min(regions.bytes - regions.prims)),
+                        ];
+                        list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}-attempt{attempt}"));
+                        let ranges = [
+                            (commands.offset, u64::from(records.min(32)) * u64::from(COMPUTE_STRIDE)),
+                            (commands.offset + draws, u64::from(records.min(32)) * u64::from(draw_stride(f.expanded))),
+                        ];
+                        list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}-attempt{attempt}"));
+                    }
+                }
+                let ready = self.prepare_for(list, false, true);
+                drawn |= ready;
+                if ready {
+                    unsafe {
+                        for (param, at) in f.inputs.into_iter().zip([0, regions.indices, regions.prims]) {
+                            l.SetGraphicsRootShaderResourceView(param, base + at);
+                        }
+                        l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+                        if !f.expanded {
+                            l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                                BufferLocation: base + regions.indices,
+                                SizeInBytes: index_bytes,
+                                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                            }));
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
+                        let offset = if signatures.portable {
+                            u64::from(record) * u64::from(draw_stride(f.expanded)) + 8
+                        } else { 0 };
+                        l.ExecuteIndirect(&signatures.draw, if signatures.portable { 1 } else { records },
+                            &commands.buffer, commands.offset + draws + offset, None, 0);
+                    }
+                    self.set_topology(list, self.topology);
+                }
+                unsafe { l.ResourceBarrier(&[transition(&data.buffer, read, uav)]) };
             }
-            unsafe { l.ResourceBarrier(&[transition(&data.buffer, read, uav)]) };
         }
         unsafe { l.ResourceBarrier(&[transition(&commands.buffer, argument, uav)]) };
         list.mesh_scratch_recycle();

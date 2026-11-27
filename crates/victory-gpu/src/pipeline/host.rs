@@ -885,6 +885,7 @@ impl HostPipeline {
                 outputs,
                 inputs[0],
                 f.expanded,
+                std::env::var_os("VICTORY_MESH_INDIRECT_STATEFUL").is_none_or(|v| v != "1"),
             );
             if let Err(e) = &signatures {
                 tracing::warn!(error = %e, ?shaders, "no mesh fallback command signatures");

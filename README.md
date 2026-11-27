@@ -189,3 +189,17 @@ commits taken from elsewhere name the commit and its author.
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+
+### Portable indirect mesh fallback
+
+On hosts without mesh shaders, the compute fallback binds its output buffers
+explicitly and executes each indirect compute/draw pair before reusing them.
+This uses ordinary indirect commands and does not require state-changing
+indirect root descriptors. Some Wine/vkd3d configurations accept those advanced
+signatures but execute no work when device-generated commands are unavailable.
+
+For comparison on implementations with functional state-changing indirect
+commands, `VICTORY_MESH_INDIRECT_STATEFUL=1` selects the earlier batched path.
+The portable path is the default. This concerns the software mesh fallback;
+hardware mesh shaders continue to use their existing path.

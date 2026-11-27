@@ -279,3 +279,102 @@ fn the_buffer_fits_its_regions() {
         assert_eq!(r.index_bytes, i);
     }
 }
+
+
+// Run the actual portable command signature, not just the converter: stateful
+// indirect root updates can be accepted by vkd3d yet perform no work without DGC.
+#[test]
+fn portable_dispatches_execute_each_record_with_static_output_bindings() {
+    let Some(device) = device() else { panic!("a D3D12 device is required") };
+    let source = r#"
+#define RS "UAV(u0), UAV(u1), UAV(u2)"
+RWByteAddressBuffer vertices : register(u0);
+RWByteAddressBuffer indices : register(u1);
+RWByteAddressBuffer prims : register(u2);
+[RootSignature(RS)]
+[numthreads(1,1,1)]
+void main(uint3 group : SV_GroupID) {
+    vertices.Store(group.x * 4, 100u + group.x);
+    indices.Store(group.x * 4, 200u + group.x);
+    prims.Store(group.x * 4, 300u + group.x);
+}
+"#;
+    let root = crate::rootstring::make(&device, source).unwrap();
+    let code = crate::dxc::compile(source, "main", "cs_5_1").unwrap();
+    let signatures = signatures(&device, (&root, &root), [0,1,2], 0, false, true).unwrap();
+    assert!(signatures.portable);
+    let regions = Regions { capacity: 3, indices: 256, prims: 512, index_bytes: 256, bytes: 768 };
+    let layout = victory_shader::emit::MeshLayout {
+        threads: 1, max_vertices: 1, max_primitives: 1, vertex_dwords: 1, primitive_dwords: 1,
+    };
+    let output = buffer(&device, D3D12_HEAP_TYPE_DEFAULT, regions.bytes,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: a live output resource.
+    let base = unsafe { output.GetGPUVirtualAddress() };
+    let commands = run(&device, &[2,1,1, 3,1,1], (2,12), None, |_| {
+        let mut p = plan((2,12,false), &layout, &regions, false, base, 256);
+        p[15] = 1;
+        p
+    }, 80);
+    // Each record starts at zero; their sum is larger than capacity. Serial
+    // output reuse must preserve both rather than culling the second record.
+    assert_eq!(commands[6], 2);assert_eq!(commands[16], 3);
+    assert_eq!(commands[64 + 2], 6);assert_eq!(commands[72 + 2], 9);
+    let arguments = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, 320,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    let zeros = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, regions.bytes,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    let back = buffer(&device, D3D12_HEAP_TYPE_READBACK, regions.bytes * 2,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: every resource and command object remains alive until the fence.
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        arguments.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped)).unwrap();
+        std::ptr::copy_nonoverlapping(commands.as_ptr(), mapped.cast::<u32>(), commands.len());
+        arguments.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 320 }));
+        zeros.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped)).unwrap();
+        std::ptr::write_bytes(mapped.cast::<u8>(), 0, regions.bytes as usize);
+        zeros.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: regions.bytes as usize }));
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        }).unwrap();
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
+        }).unwrap();
+        let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        for record in 0..2u64 {
+            list.CopyResource(&output, &zeros);
+            list.ResourceBarrier(&[transition(&output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.SetComputeRootSignature(&root);list.SetPipelineState(&pso);
+            for (param, at) in [0,256,512].into_iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView(param as u32, base + at);
+            }
+            list.ExecuteIndirect(&signatures.compute, 1, &arguments, record * 40 + 24, None, 0);
+            list.ResourceBarrier(&[transition(&output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&back, record * regions.bytes, &output, 0, regions.bytes);
+            list.ResourceBarrier(&[transition(&output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+        list.Close().unwrap();queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.Signal(&fence, 1).unwrap();
+        while fence.GetCompletedValue() < 1 {
+            device.GetDeviceRemovedReason().unwrap();
+            std::thread::yield_now();
+        }
+        back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 1536 }), Some(&mut mapped)).unwrap();
+        let got = std::slice::from_raw_parts(mapped.cast::<u32>(), 384).to_vec();
+        back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        for (record, groups) in [2usize,3].into_iter().enumerate() {
+            for (offset, first) in [(0,100),(64,200),(128,300)] {
+                for lane in 0..3 {
+                    assert_eq!(got[record*192+offset+lane],
+                        if lane < groups { first + lane as u32 } else { 0 },
+                        "record {record}, output {offset}, group {lane}");
+                }
+            }
+        }
+    }
+}

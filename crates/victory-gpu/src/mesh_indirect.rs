@@ -41,7 +41,7 @@ const SOURCE: &str = r#"
 cbuffer Plan : register(b0) {
     uint records; uint stride; uint counted; uint capacity;
     uint vertex_bytes; uint primitives; uint prim_bytes; uint expanded;
-    uint2 vertices; uint2 indices; uint2 prims; uint draws; uint unused;
+    uint2 vertices; uint2 indices; uint2 prims; uint draws; uint portable;
 };
 // The title's records (clamped: x groups, then 1, 1) and their count.
 RWByteAddressBuffer args : register(u0);
@@ -58,6 +58,9 @@ void main() {
     // Groups of the records so far: where the next record's output starts.
     uint used = 0;
     for (uint i = 0; i < records; i++) {
+        // Portable dispatch/draw pairs finish using the output before the
+        // next record reuses it. Their root descriptors stay fixed.
+        if (portable != 0) used = 0;
         uint g = i < n ? args.Load(i * stride) : 0u;
         if (g > capacity - used) {
             g = 0;
@@ -131,6 +134,8 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Convert> {
 pub(crate) struct Signatures {
     pub(crate) compute: ID3D12CommandSignature,
     pub(crate) draw: ID3D12CommandSignature,
+    /// Plain indirect commands with explicitly bound output descriptors.
+    pub(crate) portable: bool,
 }
 
 pub(crate) fn signatures(
@@ -139,6 +144,7 @@ pub(crate) fn signatures(
     outputs: [u32; 3],
     vertices: u32,
     expanded: bool,
+    portable: bool,
 ) -> windows::core::Result<Signatures> {
     let uav = |index| D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
@@ -173,7 +179,7 @@ pub(crate) fn signatures(
             D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED
         }),
     ];
-    let make = |args: &[D3D12_INDIRECT_ARGUMENT_DESC], stride, root: &ID3D12RootSignature| {
+    let make = |args: &[D3D12_INDIRECT_ARGUMENT_DESC], stride, root: Option<&ID3D12RootSignature>| {
         let desc = D3D12_COMMAND_SIGNATURE_DESC {
             ByteStride: stride,
             NumArgumentDescs: args.len() as u32,
@@ -185,9 +191,19 @@ pub(crate) fn signatures(
         unsafe { device.CreateCommandSignature(&desc, root, &mut signature)? };
         signature.ok_or_else(windows::core::Error::empty)
     };
+    // Some D3D12 translations accept state-changing signatures but execute
+    // no work when device-generated commands are unavailable. The portable
+    // path requires only ordinary indirect dispatch/draw, with static roots.
     Ok(Signatures {
-        compute: make(&compute, COMPUTE_STRIDE, compute_root)?,
-        draw: make(&draw, draw_stride(expanded), draw_root)?,
+        compute: if portable {
+            make(&[plain(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)], COMPUTE_STRIDE, None)?
+        } else { make(&compute, COMPUTE_STRIDE, Some(compute_root))? },
+        draw: if portable {
+            make(&[plain(if expanded { D3D12_INDIRECT_ARGUMENT_TYPE_DRAW } else {
+                D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED
+            })], draw_stride(expanded), None)?
+        } else { make(&draw, draw_stride(expanded), Some(draw_root))? },
+        portable,
     })
 }
 
