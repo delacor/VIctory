@@ -188,6 +188,10 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let desc = adapter.cast::<IDXGIAdapter1>().map_err(err)?.GetDesc1().map_err(err)?;
+                if !software(&desc) {
+                    return Err("EnumWarpAdapter returned a hardware adapter; software checks are unavailable".to_owned());
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 let hardware = create_preferred_device().map_err(err)?;
@@ -202,6 +206,9 @@ impl Host {
                 device = Some(hardware);
             }
             let device = device.ok_or("no device")?;
+            if warp && !software(&adapter_desc(&device).map_err(err)?) {
+                return Err("the requested software device selected hardware".to_owned());
+            }
             let sm = shader_model(&device).map_err(err)?;
             if sm.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!("the device supports SM {:#x} only", sm.0));
@@ -1739,5 +1746,17 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+
+#[test]
+fn a_warp_request_never_returns_a_hardware_device() {
+    match Host::new(true) {
+        Ok(host) => {
+            let desc = adapter_desc(&host.device).expect("the actual device adapter");
+            assert!(software(&desc), "a hardware device was labeled WARP");
+        }
+        Err(e) => eprintln!("software-only device unavailable: {e}"),
     }
 }
