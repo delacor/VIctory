@@ -2155,6 +2155,7 @@ mod prelude_upload_tests {
 
         let base_from = ref_count(&from);
         let base_to = ref_count(&to);
+        eprintln!("ALIAS_PIN_TEST actual hardware textures ready");
         assert!(super::alias(&list, placed, source));
         assert!(
             ref_count(&from) > base_from,
