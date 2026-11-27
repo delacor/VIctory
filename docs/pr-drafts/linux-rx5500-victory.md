@@ -43,7 +43,8 @@ claim this fixes that crash until a replay confirms it.
   launch flags and reduced output dimensions are environment setup, not this PR.
 
 The investigation report is ../linux-rx5500-investigation.md. No 20-FPS claim is
-supported: the latest tested sequence was about 4–5 FPS and crashed.
+supported. Later controlled allocation comparisons complete without a logged
+exception/reset and reach about 5.6 FPS; geometry and lighting remain incomplete.
 
 ## Cache performance change belongs to the 7900XTX fork
 
@@ -53,7 +54,7 @@ the same per-miss full retain scan found in the tested fork.
 
 Local commit 37d89d3b5 is therefore a 7900XTX/fork stopgap, not a patch to submit
 unchanged here. Its real-resource regression and optimized Windows builds pass;
-its game timing is pending. Review the other draft for that independent change.
+its cache-only replay completed; that run does not isolate a causal FPS gain. Review the other draft for that independent change.
 A broader port of upstream's arena should preserve all slice offsets, descriptor
 addresses and refresh/lifetime rules, and needs its own validation.
 
@@ -68,3 +69,8 @@ presented as newly invented code.
 The view-pool live A/B improvement is about 3.74 to 5.15 FPS in the existing
 feature profile. The ray-tracing structure builder is disabled in that profile.
 No complete-rendering or 20-FPS claim is supported.
+
+The later independent mesh-size A/B measured 4.75 to 5.62 FPS at similar draw
+counts, with view pooling fixed on. This still does not verify sustained 20 FPS.
+The refreshed Belobug merge is separately qualified; do not attribute the
+measured gains to every new fork change.

@@ -56,7 +56,7 @@ barycentric path with a default-off switch. Thirteen existing shader tests pass,
 including actual GPU pixel readback, and eight real pipeline records that were
 refused before now create successfully. The character and surrounding scene
 are visible in the subsequent replay. Some image detail is still incorrect,
-frame rate remains about 3–4 FPS, and the backend fallback has interpolation
+the original backend experiment measured about 3–4 FPS, and the backend fallback has interpolation
 limitations. Do not present it as native feature support or a 20-FPS result.
 
 Keep that backend patch and its limitations separate from VIctory source fixes.
@@ -79,7 +79,7 @@ The actual D3D12 resource regression passes: an externally held Shadow, a
 buffer still referenced by a host view, and a recent entry survive a sweep;
 after references are released and age expires, idle entries are reclaimed
 within the bounded sweep interval. The optimized Windows test and application builds pass.
-The in-game comparison is pending; no FPS gain is claimed.
+The cache-only replay completed; it does not isolate a causal FPS gain.
 
 Submit only against a base that has this exact-view cache, preserving that
 base's invalidation and reference checks. Keep this separate from correctness
@@ -121,5 +121,17 @@ and delayed retirement.
 
 Two imported allocator tests fail on the original 16-MiB minimum and pass after
 the change. A third verifies recycling retains UAV state. Optimized Windows
-build passes; live timing and memory comparison are pending. This belongs with
+build passes. Four warm matched 30-second off/on pairs measured 210.7 versus
+177.8 ms/frame (4.75 versus 5.62 FPS), with view pooling fixed on.
+The reused allocator state prevents a cold-start VRAM-savings claim. This belongs with
 the compute fallback prerequisite and remains separate from the view-buffer pool.
+
+The first mesh live-memory gauge omitted buffers freed on direct list
+destruction. Its inflated totals must not be cited as resident VRAM or a memory
+saving. The refreshed candidate corrects that telemetry path; GPU ordering,
+allocation sizes and delayed retirement are unchanged by the counter fix.
+
+The separate Belobug refresh preserves DS4 and imports newer diagnostics,
+descriptor synchronization and crash checks. It is not the same executable as
+the measured allocation A/B; its complete validation status belongs in the
+investigation ledger before submission.

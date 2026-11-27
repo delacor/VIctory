@@ -12,8 +12,9 @@ corrections completed a six-minute 3D observation window without that exception
 or a GPU reset: 66 compilation-idle frame-log samples had median 3.9 FPS
 (range 3.5–5.5). It was then stopped by the controller (exit 143).
 The later barycentric experiment renders the character and surrounding scene,
-but some detail remains incorrect and timing is still around 3–4 FPS. This is not a successful performance
-baseline, and no result here establishes 20 FPS.
+but geometry and lighting remain incomplete. The original experiment ran around
+3–4 FPS; allocation changes below subsequently improve timing. No result here
+establishes complete rendering or sustained 20 FPS.
 
 The pooled-view-buffer A/B run now measures a warmed improvement at comparable
 draw counts: 267.7 ms/frame (3.74 FPS) with committed buffers versus
@@ -23,6 +24,11 @@ with mean draw counts differing by less than 5%. No compiler or sampling
 profiler ran during those pairs. The ray-tracing structure builder remains
 disabled by the fork's default on both sides; this is not a full-feature or
 20-FPS verification.
+
+The separate mesh-sizing A/B, with view pooling fixed on, measured 210.7 ms/frame
+(4.75 FPS) with 16-MiB first chunks versus 177.8 ms/frame (5.62 FPS) with 1-MiB
+first chunks. Four warm matched pairs contain 553 off frames and 654 on frames.
+This is a within-run comparison; do not add gains from different runs.
 
 A previous run showed incomplete scenery. Correctness must be checked alongside
 timing: black frames, omitted draws, or missing geometry cannot count as a gain.
@@ -38,11 +44,11 @@ in the saved game settings.
   report payloads, or proprietary code are included in this report.
 - Windows GNU LLVM target; Rust 1.98.1 and LLVM MinGW 20261117. Diagnostic
   builds use optimization level 3 with line information.
-- The tested fork starts at Belobug/VIctory-Belobug-AMD a-publier cd8dfc06a,
-  on local branch perf20/linux-rx5500. The last launched executable was
-  50ec3f9e9; 95e95d5c1 adds an unwind guard. The fence/compositor candidate at 1bedfd6ce
-  passed its focused tests and the six-minute observation window. The document
-  commit is 24255dd04; the later backend experiment uses the same application code.
+- The measured branch perf20/linux-rx5500 starts at Belobug's a-publier
+  cd8dfc06a. The last measured code is d9e5ad914 (view pooling plus mesh sizing).
+  A separate refresh branch perf20/belobug-refresh-20261127 merges a-publier
+  4eb6cfdf9 at 334df1b17; its runtime validation is tracked separately below.
+  The earlier measured source and runtime remain available for comparison.
 - Private vkd3d-proton build: official commit
   71cae091b06571e51446cf2a937f0b04c237c04d. Private Wine server described below.
   Neither replaces the system installation.
@@ -371,7 +377,8 @@ has been merged.
   measured separately.
 - Small first mesh scratch chunk: two fail-before allocator regressions; all
   three after-change checks and optimized Windows application build pass.
-  Live comparison pending.
+  Four warm matched live pairs measured 210.7 versus 177.8 ms/frame.
+  The initial live-memory gauge is invalid; see its correction below.
 
 ## Submission plan
 
@@ -471,8 +478,82 @@ directory, perf20/runs/<UTC start>. Relevant run IDs:
 | 20261126T225407Z | Barycentric opt-in: 363.4 s in 3D without logged exception/reset, median 3.5 FPS; visible character/scene, separate CPU profile |
 | 20261126T230548Z | Cache-only: 360.1 s observed in 3D, median 3.9 FPS, controller stopped |
 | 20261126T232619Z | View-pool A/B: three warm matched pairs, 267.7 ms off versus 194.0 ms on; builder disabled on both sides |
+| 20261126T234854Z | Mesh-size A/B: four warm matched pairs, 210.7 ms off versus 177.8 ms on; view pool fixed on |
 
 The private report directory out/pr-sync-2026-11-26/perf20 contains the complete
 PR inventory, selection dispositions, build/test exit files, and offline pipeline
 before/after logs. These are working evidence, not a PR payload. Public
 submissions should contain code, synthetic tests and this written analysis only.
+
+## Mesh-sizing result and measurement correction
+
+The d9e5ad914 replay completed 361.3 seconds after the controller detected 3D,
+then stopped deliberately (143); no reported exception or kernel GPU fault.
+Completed phase pairs 6/7, 8/9, 10/11 and 12/13 begin after 90 seconds in 3D.
+Their off/on mean draw counts are 1102/1100, 1069/1069, 1069/1073 and 1062/1094.
+The frame-weighted means are 210.673 ms off and 177.821 ms on: about 15.6% less
+frame time, or 18.5% higher throughput. Early loading/warm phases are excluded.
+
+The same-process allocator and free lists persist between phases, so this
+does not establish cold-start VRAM savings. The new mesh-scratch counter also
+missed chunks freed directly when a host list was destroyed without another
+reset. Its reported hundreds of GiB are invalid as live memory, not evidence
+that that much VRAM was resident. The refreshed source decrements those
+still-owned chunks in MeshScratch::drop; reset/drained chunks retain the
+existing delayed-release accounting. This changes telemetry only.
+
+## Refreshed Belobug integration and qualification
+
+The isolated merge 334df1b17 imports the full fetched a-publier 4eb6cfdf9.
+Both conflict resolutions are explicit: direct-HID DS4 fields coexist with the
+new opt-in keyboard/mouse state, and the new default-on safe unwinder supersedes
+the earlier raw frame-register guard. Its safe reader validates that same
+register against the stack before calling RtlVirtualUnwind.
+
+The optimized Windows workspace/all-target check passes. Input tests pass
+20/20 with one ignored diagnostic; crash tests pass 24/24 when retaining
+Cargo's test-executable basename. An earlier renamed test binary failed the
+module-name assertion; that is a harness error, not an unwinder defect.
+
+The broader shader suite is not fully passing. The quad-neighbour graphics
+test asserts in Wine at vkCreateGraphicsPipelines; the same exact test asserts
+on the preserved pre-refresh shader binary. With that one excluded, the suite
+reports 305 passed, four ignored and one failure: stub_pipeline_is_created
+expects malformed container hashes to be refused, but this vkd3d backend
+accepts them. That test also fails on the baseline. Neither failure is waived
+or fixed by this merge; no complete shader-suite success is claimed.
+
+The optimized application build passes. Focused GPU checks pass: eleven pool
+tests, three mesh allocator tests, seven cache/failure-fingerprint tests, four
+descriptor-sync tests, the signature parser, six async-lane tests, held-fence
+ownership, actual compositor pixel readback, actual off-element view refresh
+and the Wine hole-cache check. An initial lane filter selected zero tests; its
+zero exit was not counted, and the actual queue::behind tests were then run.
+Runtime qualification of this refreshed executable is still pending.
+The translator version changes from 1 to 2, invalidating old translations;
+warm-up differences must be excluded from steady-state comparisons.
+
+## Refreshed targeted discussion
+
+Nine relevant issue/PR comment threads were fetched separately from the full
+metadata sweep. The original [issue 1842 discussion](https://github.com/Marvisak/VIctory/issues/1842)
+already distinguishes the Linux post-loading texture-guard workaround from the
+Windows intro-video report; no broader resolved claim is justified.
+
+[7900XTX #274](https://github.com/avatarmanz/VIctory-7900XTX/pull/274)
+and its newer mapper-side follow-up report that Wine/RADV may accept a heap
+opened on a section view while the GPU reads independent zero-filled memory.
+A successful import call alone is insufficient. Any in-place-memory trial
+must first verify actual GPU readback and reject unsupported imports before
+rearranging the title's pages. These are other testers' findings; they have not
+yet been reproduced on this RX 5500 XT.
+
+## Observer overhead correction
+
+The old external controller's regex ran across every log line, even lines
+without frame timings. On the saved 600-kB tail it took 2157.19 ms; filtering
+frame lines first took 0.90 ms and returned identical seven timing rows.
+Future runs also read only the bounded tail rather than rereading the whole
+file. This is a local test-harness fix, not an application performance PR.
+Earlier within-run A/B pairs used the same observer on both sides. Cross-run
+timings after this change cannot isolate an application-code improvement.
