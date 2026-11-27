@@ -112,11 +112,24 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
     for entry in unread {
         eprintln!("VIctory: a profile was not understood and is skipped: {entry}");
     }
-    std::thread::spawn(move || {
+    if let Err(error) = spawn_profiler(move || {
         for one in all {
             profile(one, start, phase);
         }
-    });
+    }) {
+        eprintln!("VIctory: could not start the profile thread: {error}");
+    }
+}
+
+/// Kept separate so the regression measures the thread that is actually used.
+fn spawn_profiler<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> std::io::Result<std::thread::JoinHandle<T>> {
+    // RUST_MIN_STACK may be deliberately large for translator workers.
+    // Wine reserves these stacks below 4 GiB, where the title also needs
+    // its graphics heap; this observer does not translate shaders.
+    std::thread::Builder::new()
+        .name("victory-profile".into())
+        .stack_size(4 << 20)
+        .spawn(work)
 }
 
 fn profile((from, to, every, file): (Duration, Duration, Duration, String), start: Instant, phase: fn() -> u32) {
@@ -305,6 +318,31 @@ mod tests {
         let (all, unread) = schedule("0,60,5,a.txt;");
         assert_eq!(all.len(), 1);
         assert!(unread.is_empty());
+    }
+
+    /// A large RUST_MIN_STACK is needed by some translator workers, but
+    /// must not consume another 128 MiB of low address space for this
+    /// sleeping observer. Run with RUST_MIN_STACK=134217728 under Wine.
+    #[test]
+    fn the_profiler_keeps_a_small_reserved_stack_with_a_large_global_default() {
+        let reserved = spawn_profiler(|| {
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+            let (mut low, mut high) = (0usize, 0usize);
+            // SAFETY: writes the current thread's stack bounds.
+            unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+            let local = 0u8;
+            let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // The allocation base is the reserved bottom, rather than only
+            // the committed low bound (GetCurrentThreadStackLimits on Wine).
+            // SAFETY: a live local and an output structure of its exact size.
+            assert_ne!(unsafe {
+                VirtualQuery((&raw const local).cast(), &mut region, std::mem::size_of_val(&region))
+            }, 0);
+            high.checked_sub(region.AllocationBase as usize).expect("stack allocation")
+        }).expect("profiler thread").join().expect("profiler thread completes");
+        eprintln!("profiler reserved stack: {reserved} bytes");
+        assert!(reserved > 0 && reserved <= 8 << 20, "reserved {reserved} bytes");
     }
 
     fn temp_file(name: &str) -> String {
