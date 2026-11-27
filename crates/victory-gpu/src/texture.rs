@@ -328,6 +328,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
+    list.keep(from);
+    list.keep(to);
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
@@ -2119,6 +2121,63 @@ mod prelude_upload_tests {
                 gpu_frame[slot]
             );
         }
+    }
+
+    #[test]
+    fn alias_pins_source_and_placed_until_list_reset() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let ref_count = |r: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| -> u32 {
+            let raw = r.as_raw().cast_const() as crate::object::This;
+            let add_ref =
+                crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(raw, 0x08);
+            let release =
+                crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(raw, 0x10);
+            let _ = add_ref(raw);
+            release(raw)
+        };
+
+        let source = crate::resource::test_texture(4, 4, 28);
+        let placed = crate::resource::test_texture(4, 4, 87);
+        crate::resource::want_level(source, 0);
+        crate::resource::want_level(placed, 0);
+        let Some(from) = crate::resource::host_resource(source).cloned() else {
+            return;
+        };
+        let Some(to) = crate::resource::host_resource(placed).cloned() else {
+            return;
+        };
+
+        let base_from = ref_count(&from);
+        let base_to = ref_count(&to);
+        assert!(super::alias(&list, placed, source));
+        assert!(
+            ref_count(&from) > base_from,
+            "alias copy must pin source host resource on the command list"
+        );
+        assert!(
+            ref_count(&to) > base_to,
+            "alias copy must pin placed host resource on the command list"
+        );
+
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(ref_count(&from), base_from);
+        assert_eq!(ref_count(&to), base_to);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        let release = |res: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(res, 0x10)(res)
+        };
+        assert_eq!(release(placed), 0);
+        assert_eq!(release(source), 0);
     }
 }
 
