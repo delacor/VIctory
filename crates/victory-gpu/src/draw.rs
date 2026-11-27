@@ -3471,19 +3471,29 @@ impl State {
                     {
                         static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
-                        let vertices = f.layout.bytes(16);
-                        let triangles = f.layout.bytes(128);
-                        let ranges = [
-                            (data.offset, vertices[0].min(regions.indices)),
-                            (data.offset + regions.indices, triangles[1].min(regions.index_bytes)),
-                            (data.offset + regions.prims, triangles[2].min(regions.bytes - regions.prims)),
-                        ];
-                        list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}-attempt{attempt}"));
-                        let ranges = [
-                            (commands.offset, u64::from(records.min(32)) * u64::from(COMPUTE_STRIDE)),
-                            (commands.offset + draws, u64::from(records.min(32)) * u64::from(draw_stride(f.expanded))),
-                        ];
-                        list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}-attempt{attempt}"));
+                        static ARGS_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        let args_only = *ARGS_ONLY.get_or_init(|| std::env::var_os("VICTORY_MESH_CAPTURE_ARGS_ONLY").is_some_and(|v| v == "1"));
+                        // The converter writes every record before this loop;
+                        // no later pair changes the commands. Capture them once,
+                        // including zero-work records, within the existing 64 MiB
+                        // and twelve-snapshot limit. Never truncate at record 32.
+                        if record == 0 {
+                            let ranges = [
+                                (commands.offset, u64::from(records) * u64::from(COMPUTE_STRIDE)),
+                                (commands.offset + draws, u64::from(records) * u64::from(draw_stride(f.expanded))),
+                            ];
+                            list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}-records{records}-cap{}-expanded{}-attempt{attempt}", regions.capacity, u8::from(f.expanded)));
+                        }
+                        if !args_only {
+                            let vertices = f.layout.bytes(16);
+                            let triangles = f.layout.bytes(128);
+                            let ranges = [
+                                (data.offset, vertices[0].min(regions.indices)),
+                                (data.offset + regions.indices, triangles[1].min(regions.index_bytes)),
+                                (data.offset + regions.prims, triangles[2].min(regions.bytes - regions.prims)),
+                            ];
+                            list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}-attempt{attempt}"));
+                        }
                     }
                 }
                 let ready = self.prepare_for(list, false, true);
