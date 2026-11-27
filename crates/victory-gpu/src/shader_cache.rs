@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The encoding of entries ([`encode`]), part of the key.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 4;
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -275,7 +275,7 @@ fn cached_by(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -369,6 +369,11 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -439,6 +444,11 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some((
         HostShader {
         stage,
@@ -450,6 +460,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
         },
         made_by,
     ))
@@ -486,6 +497,17 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
+        }
+    }
+
+    #[test]
+    fn half_metadata_does_not_reuse_older_entry_formats() {
+        let mut bytes = encode(&shader(), SOURCE);
+        assert_eq!(decode(&bytes).unwrap().0, shader());
+        for magic in [b"VSH2", b"VSH3"] {
+            bytes[..4].copy_from_slice(magic);
+            assert!(decode(&bytes).is_none(), "old metadata cannot describe unsigned half twins");
         }
     }
 
@@ -510,7 +532,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH4 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
