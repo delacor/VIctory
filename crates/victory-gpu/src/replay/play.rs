@@ -44,6 +44,17 @@ pub const COMPARE: &str = "victory: card compare";
 /// An upload buffer contents come back through.
 const STAGING: u64 = 256 << 20;
 
+/// Heap flags a replay has no use for: sharing (also across adapters),
+/// display, made not resident, not zeroed. The host makes new memory not
+/// resident and then resident itself (`VICTORY_WAIT_RESIDENT`, on by
+/// default); nothing here would, and on an RX 7900 XT the first copy into
+/// memory left so lost the device.
+const DROP: i32 = D3D12_HEAP_FLAG_SHARED.0
+    | D3D12_HEAP_FLAG_ALLOW_DISPLAY.0
+    | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0
+    | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0
+    | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
+
 /// Where buffers the CPU saw lie in a replay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Buffers {
@@ -767,8 +778,6 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -3581,5 +3590,18 @@ mod tests {
             ..Default::default()
         };
         assert!(o.edited() && !o.plain().edited() && o.plain().buffers == Buffers::Card);
+    }
+
+    #[test]
+    fn flags_a_replay_drops() {
+        // As the host makes a block of textures: kept apart from render
+        // targets, and not resident until it says so.
+        let blocks = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        let host = blocks | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
+        assert_eq!(host.0 & !DROP, blocks.0);
+        // A heap opened from memory: shared, also across adapters.
+        let atomics = D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+        let opened = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | atomics;
+        assert_eq!(opened.0 & !DROP, atomics.0);
     }
 }

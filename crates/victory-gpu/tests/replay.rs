@@ -719,10 +719,18 @@ impl Scene {
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                // As the host makes a block of textures: not resident, and
+                // made so before anything is placed in it. Nothing in a
+                // replay makes memory resident: it makes the block again
+                // without the flag.
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                    | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
             };
             device.CreateHeap(&desc, &mut memory).unwrap();
             let memory = memory.unwrap();
+            device
+                .MakeResident(&[Some(memory.cast::<ID3D12Pageable>().unwrap())])
+                .unwrap();
             let placed = || {
                 let mut made: Option<ID3D12Resource> = None;
                 let d = texture_desc(16, rgba, D3D12_RESOURCE_FLAG_NONE);
