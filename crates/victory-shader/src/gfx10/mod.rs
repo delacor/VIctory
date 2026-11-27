@@ -389,8 +389,17 @@ mod tests {
 
     #[test]
     fn vop1_without_operands_has_no_extension_word() {
-        assert_eq!(summary(&[0x7E00_00FF, S_ENDPGM]), [(0, 1, "v_nop"), (4, 1, "s_endpgm")]);
-        assert_eq!(summary(&[0x7E00_36FF, S_ENDPGM]), [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]);
+        for (opcode, name) in [(0, "v_nop"), (0x1b, "v_pipeflush"), (0x41, "v_clrexcp")] {
+            for source in [0xff, 0xf9, 0xfa, 0xe9, 0xea] {
+                let nop = 0x7e00_0000 | opcode << 9 | source;
+                // The following move really has a literal; it must remain a
+                // separate two-word instruction after the source-less one.
+                assert_eq!(
+                    summary(&[nop, 0x7e00_02ff, 0x4000_0000, S_ENDPGM]),
+                    [(0, 1, name), (4, 2, "v_mov_b32"), (12, 1, "s_endpgm")],
+                );
+            }
+        }
     }
 
     #[test]
