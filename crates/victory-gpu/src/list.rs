@@ -2489,3 +2489,7 @@ mod tests {
         }
     }
 }
+
+
+#[cfg(all(test, windows))]
+mod factory_pool_tests;
