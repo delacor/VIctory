@@ -3456,6 +3456,28 @@ impl State {
                 l.ExecuteIndirect(&signatures.compute, records, &commands.buffer, commands.offset, None, 0);
                 l.ResourceBarrier(&[transition(&data.buffer, uav, read)]);
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                static MESH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                let selected = MESH.get_or_init(|| std::env::var("VICTORY_MESH_CAPTURE").ok()
+                    .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())));
+                if let Some(hash) = selected
+                    && p.stages.first().is_some_and(|s| s.shader.hash == *hash)
+                {
+                    let sampled = f.layout.bytes(2);
+                    let ranges = [
+                        (data.offset, sampled[0].min(regions.indices)),
+                        (data.offset + regions.indices, sampled[1].min(regions.index_bytes)),
+                        (data.offset + regions.prims, sampled[2].min(regions.bytes - regions.prims)),
+                    ];
+                    list.capture_buffer_parts(&data.buffer, read, &ranges, &format!("mesh-data-{hash}"));
+                    let ranges = [
+                        (commands.offset, u64::from(records.min(32)) * u64::from(COMPUTE_STRIDE)),
+                        (commands.offset + draws, u64::from(records.min(32)) * u64::from(draw_stride(f.expanded))),
+                    ];
+                    list.capture_buffer_parts(&commands.buffer, argument, &ranges, &format!("mesh-commands-{hash}"));
+                }
+            }
             drawn = self.prepare_for(list, false, true);
             if drawn {
                 unsafe {

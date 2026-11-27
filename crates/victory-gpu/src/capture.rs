@@ -1017,6 +1017,15 @@ pub(crate) fn pass_specs() -> &'static [(String, Option<(u8, u32)>)] {
 /// interval per process. Query the actual footprint before reserving bytes.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn reserve_pass(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, label: &str) -> Option<String> {
+    let mut bytes = 0;
+    // SAFETY: an ordinary footprint query with owned output storage.
+    unsafe { device.GetCopyableFootprints(desc, 0, 1, 0, None, None, None, Some(&mut bytes)); }
+    if bytes == u64::MAX { return None }
+    reserve_pass_bytes(label, bytes)
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn reserve_pass_bytes(label: &str, bytes: u64) -> Option<String> {
     static STATE: std::sync::Mutex<(Option<u64>, usize, u64)> = std::sync::Mutex::new((None, 0, 0));
     let folder = folder()?;
     let frame = crate::queue::presented() + 1;
@@ -1027,10 +1036,7 @@ pub(crate) fn reserve_pass(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, la
         state.0 = Some(frame);
     }
     if state.0 != Some(frame) || state.1 >= 12 { return None }
-    let mut bytes = 0;
-    // SAFETY: an ordinary footprint query with owned output storage.
-    unsafe { device.GetCopyableFootprints(desc, 0, 1, 0, None, None, None, Some(&mut bytes)); }
-    if bytes == u64::MAX || state.2.checked_add(bytes)? > 64 << 20 { return None }
+    if bytes == 0 || state.2.checked_add(bytes)? > 64 << 20 { return None }
     let name = format!("pass-{frame}-{:02}-{label}", state.1);
     state.1 += 1;
     state.2 += bytes;
@@ -1098,5 +1104,65 @@ mod pass_tests {
                 });
             }
         }
+    }
+}
+
+/// Exact ranges of an already readable buffer, packed into one readback.
+/// No transitions here: the caller restores the known source state.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn read_buffer_parts(
+    device: &ID3D12Device, list: &ID3D12GraphicsCommandList,
+    source: &ID3D12Resource, ranges: &[(u64, u64)],
+) -> Option<ID3D12Resource> {
+    // SAFETY: a live resource.
+    let desc = unsafe { source.GetDesc() };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER { return None }
+    let mut bytes = 0u64;
+    for &(offset, len) in ranges {
+        if offset.checked_add(len)? > desc.Width { return None }
+        bytes = bytes.checked_add(len)?;
+    }
+    if bytes == 0 || bytes > 1 << 20 { return None }
+    let mut buffer: Option<ID3D12Resource> = None;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1,
+        DepthOrArraySize: 1, MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+    };
+    // SAFETY: descriptions and ranges are owned and validated above.
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer,
+        ).ok()?;
+        let buffer = buffer?;
+        let mut at = 0;
+        for &(offset, len) in ranges {
+            if len != 0 { list.CopyBufferRegion(&buffer, at, source, offset, len); }
+            at += len;
+        }
+        Some(buffer)
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod mesh_buffer_tests {
+    use super::*;
+    #[test]
+    fn packed_buffer_readback_keeps_range_order_and_rejects_overruns() {
+        let host = crate::host::host().expect("a hardware D3D12 device");
+        let (source, data) = host.upload_buffer(32).unwrap();
+        // SAFETY: the owned upload mapping is 32 bytes.
+        unsafe { for i in 0..32 { data.add(i).write(i as u8); } }
+        let list = host.new_list().unwrap();
+        assert!(read_buffer_parts(&host.device, &list.list, &source, &[(31, 2)]).is_none());
+        assert!(read_buffer_parts(&host.device, &list.list, &source, &[(u64::MAX, 2)]).is_none());
+        assert!(read_buffer_parts(&host.device, &list.list, &source, &[]).is_none());
+        let buffer = read_buffer_parts(&host.device, &list.list, &source, &[(16, 16), (0, 8)]).unwrap();
+        list.close();host.execute(&[&list]);
+        with_readback_bytes(&buffer, |bytes| {
+            assert_eq!(bytes, (16u8..32).chain(0..8).collect::<Vec<_>>());
+        });
     }
 }

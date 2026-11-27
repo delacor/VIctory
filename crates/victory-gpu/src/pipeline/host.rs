@@ -909,7 +909,13 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
-                state: String::new(),
+                state: format!(
+                    "mesh depth {} write {} func {}; stencil {}; cull {} front-ccw {}; targets {:?}",
+                    g.depth.DepthEnable.as_bool(), g.depth.DepthWriteMask.0, g.depth.DepthFunc.0,
+                    g.depth.StencilEnable.as_bool(), g.rasterizer.CullMode.0,
+                    g.rasterizer.FrontCounterClockwise.as_bool(),
+                    &g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                ),
             });
         }
         if mesh.is_some() {

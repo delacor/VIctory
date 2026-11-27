@@ -7006,6 +7006,36 @@ impl HostList {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_buffer_parts(
+        &self, source: &ID3D12Resource, state: D3D12_RESOURCE_STATES,
+        ranges: &[(u64, u64)], label: &str,
+    ) {
+        let bytes: u64 = ranges.iter().map(|r| r.1).sum();
+        let Some(name) = crate::capture::reserve_pass_bytes(label, bytes) else { return };
+        let Some(host) = host() else { return };
+        let copying = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: a live open list and the source state known by its caller.
+        unsafe { self.list.ResourceBarrier(&[transition(source, state, copying)]) };
+        let read = crate::capture::read_buffer_parts(&host.device, &self.list, source, ranges);
+        // SAFETY: the state is restored before the next draw/dispatch.
+        unsafe { self.list.ResourceBarrier(&[transition(source, copying, state)]) };
+        if let Some(buffer) = read {
+            tracing::info!(%name, ?ranges, bytes, "mesh buffer readback recorded");
+            self.pass_captures.lock().unwrap_or_else(|e| e.into_inner()).push(
+                crate::capture::PassSnapshot {
+                    name, buffer,
+                    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_UNKNOWN, Width: bytes as u32, Height: 1,
+                            Depth: 1, RowPitch: bytes as u32,
+                        }, Offset: 0,
+                    },
+                },
+            );
+        }
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
