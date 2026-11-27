@@ -3322,7 +3322,8 @@ impl State {
         f: &crate::pipeline::host::MeshFallback,
         x: u32,
     ) -> bool {
-        use crate::host::{ScratchPool, transition};
+        use crate::host::ScratchPool;
+        use crate::mesh_barriers::{MeshBarriers, Access};
         if x == 0 {
             return true;
         }
@@ -3343,14 +3344,11 @@ impl State {
         };
         list.keep(&region.buffer);
         let l = &list.list;
+        let barriers = MeshBarriers::new(l);
         let base = unsafe { region.buffer.GetGPUVirtualAddress() } + region.offset;
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
         // A new region's chunk starts COMMON; after the first draw it stays
         // UAV and the pool reuses regions only after the prior draw barrier.
-        if region.first {
-            unsafe { l.ResourceBarrier(&[transition(&region.buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
-        }
+        barriers.begin(&region.buffer, region.first);
         unsafe {
             for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
                 l.SetComputeRootUnorderedAccessView(param, base + at);
@@ -3358,7 +3356,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
             l.Dispatch(x, 1, 1);
-            l.ResourceBarrier(&[transition(&region.buffer, uav, read)]);
+            barriers.between(&region.buffer, Access::Compute, Access::Vertices);
         }
         let drawn = self.prepare_for(list, false, true);
         if drawn {
@@ -3383,7 +3381,7 @@ impl State {
             }
             self.set_topology(list, self.topology);
         }
-        unsafe { l.ResourceBarrier(&[transition(&region.buffer, read, uav)]) };
+        barriers.between(&region.buffer, Access::Vertices, Access::Compute);
         list.mesh_scratch_recycle();
         drawn
     }
@@ -3395,7 +3393,8 @@ impl State {
         (args, stride, records): (u64, u32, u32),
         count: Option<u64>,
     ) -> bool {
-        use crate::host::{ScratchPool, transition};
+        use crate::host::ScratchPool;
+        use crate::mesh_barriers::{MeshBarriers, Access};
         use crate::mesh_indirect::{COMPUTE_STRIDE, draw_stride};
         let (Some(signatures), Some(convert)) = (&f.signatures, crate::mesh_indirect::convert()) else {
             once!("indirect mesh dispatches without mesh shaders dropped");
@@ -3422,6 +3421,7 @@ impl State {
         list.keep(&data.buffer);
         list.keep(&commands.buffer);
         let l = &list.list;
+        let barriers = MeshBarriers::new(l);
         let base = unsafe { data.buffer.GetGPUVirtualAddress() } + data.offset;
         let commands_gpu = unsafe { commands.buffer.GetGPUVirtualAddress() } + commands.offset;
         let mut plan = crate::mesh_indirect::plan(
@@ -3433,20 +3433,14 @@ impl State {
             draws32,
         );
         plan[15] = u32::from(signatures.portable);
+        #[cfg(feature = "diagnostics")]
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        let (common, uav, argument) = (
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        );
-        if data.first {
-            unsafe { l.ResourceBarrier(&[transition(&data.buffer, common, uav)]) };
-        }
-        if commands.first {
-            unsafe { l.ResourceBarrier(&[transition(&commands.buffer, common, uav)]) };
-        }
+        #[cfg(feature = "diagnostics")]
+        let argument = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        barriers.begin(&data.buffer, data.first);
+        barriers.begin(&commands.buffer, commands.first);
         crate::mesh_indirect::record(l, convert, &plan, args, count, commands_gpu);
-        unsafe { l.ResourceBarrier(&[transition(&commands.buffer, uav, argument)]) };
+        barriers.between(&commands.buffer, Access::Compute, Access::Arguments);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let mut drawn = false;
@@ -3465,7 +3459,7 @@ impl State {
                     let offset = if signatures.portable { u64::from(record) * u64::from(COMPUTE_STRIDE) + 24 } else { 0 };
                     l.ExecuteIndirect(&signatures.compute, if signatures.portable { 1 } else { records },
                         &commands.buffer, commands.offset + offset, None, 0);
-                    l.ResourceBarrier(&[transition(&data.buffer, uav, read)]);
+                    barriers.between(&data.buffer, Access::Compute, Access::Vertices);
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3517,10 +3511,10 @@ impl State {
                     }
                     self.set_topology(list, self.topology);
                 }
-                unsafe { l.ResourceBarrier(&[transition(&data.buffer, read, uav)]) };
+                barriers.between(&data.buffer, Access::Vertices, Access::Compute);
             }
         }
-        unsafe { l.ResourceBarrier(&[transition(&commands.buffer, argument, uav)]) };
+        barriers.between(&commands.buffer, Access::Arguments, Access::Compute);
         list.mesh_scratch_recycle();
         drawn
     }

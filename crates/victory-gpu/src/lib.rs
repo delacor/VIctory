@@ -68,6 +68,8 @@ mod port_journal;
 mod land;
 #[cfg(windows)]
 mod mesh_indirect;
+#[cfg(windows)]
+mod mesh_barriers;
 pub mod list;
 pub mod object;
 pub mod pipeline;
