@@ -3836,6 +3836,7 @@ mod tests {
         let bytes = tiled.given_bytes();
         assert_ne!(bytes, 0);
         assert_eq!(copy_state(title).unwrap().1, bytes);
+        eprintln!("TILED_ACCOUNTING_TEST mapped_bytes={bytes}");
         let list = host.new_list().unwrap();
         list.close();
         host.execute(&[&list]);
