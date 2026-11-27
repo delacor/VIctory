@@ -160,9 +160,9 @@ compute waits also left the missing body/scenery unchanged in a six-minute
 replay. None should be presented as a demonstrated performance fix. The report
 records their tests, attribution and limits.
 
-Per-root UAV write tracking from Marvisak #2948 is the next isolated experiment,
-including its root-address correctness follow-up. It must be reviewed against
-that existing PR rather than submitted as duplicate new work. Menu changes are
+Per-root UAV write tracking from Marvisak #2948, including its root-address
+correctness follow-up, was tested separately. Coordinate that work with the
+existing PR rather than submit a duplicate. Menu changes are
 no longer requested or part of the testing procedure.
 
 
@@ -178,3 +178,10 @@ A separate diagnostic reliability change gives the scheduled observer an explici
 4-MiB stack instead of inheriting the translator's 128-MiB global setting. Its
 native before/after reservation regression and related loader tests pass. See
 [the separate profiler draft](linux-profiler-stack.md); it makes no FPS claim.
+
+The later snapshot SIMD and mapping-barrier batching trials also show no
+measurable gain and remain out of the accepted build. CPU-budget heap pooling
+has passed actual-GPU allocation/readback and budget-reset checks but still
+needs a replay. The 16-MiB placement-threshold replay and complete half-buffer
+PR port are under evaluation; neither supports a new performance or visual
+correctness claim. The investigation ledger contains exact scope and results.

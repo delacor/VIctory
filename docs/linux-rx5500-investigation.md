@@ -861,3 +861,46 @@ The cached-native pipeline slots were also reviewed against later fork evidence
 pipeline descriptions. Their thousands of failed native-cache requests alone
 are not proof that thousands of rendered pipelines are missing. The ACCC/FSPX
 deserializer proposal is not imported as a speculative scenery fix.
+
+## Copy-volume and allocation qualification (27 November, 02:40 UTC)
+
+The snapshot SIMD microbenchmark did not beat the existing SSE2 memmove.
+Across 64-KiB, 1-MiB and 8-MiB chunks of mapped write-back memory into private
+snapshots, the existing path measured 8.66–8.85 GB/s versus 8.53–8.75 GB/s for
+the explicit AVX2 loop. The copy branch remains a rejected local experiment;
+no live FPS claim or accepted code change follows from it.
+
+Mapping-barrier batching (fe42c2317) preserves residency waits and coalesces
+only resource requests covered by a completed barrier. Two actual-GPU tests
+check both eight pre-cutoff creations and a creation after the cutoff, with
+numeric readback. Run 021721 completes 361.6 seconds in 3D; four matched warm
+pairs measure 172.124 ms/frame off versus 172.262 on (5.810 versus 5.805 FPS).
+Body/scenery remain incomplete. This is flat and is not promoted.
+
+A separate default-off CPU-budget pool (2f9174f0f) reuses the existing placed
+write-back heaps and their final-owner reclamation. Eight independent
+256-byte resources need eight mapping waits on the old path and at most one
+through the pool; widths, zeroing, disjoint GPU addresses and actual GPU bytes
+pass. The pool, budget-reset, batch and existing pool tests all pass, along
+with the Windows workspace/all-target check and optimized application build.
+These establish allocation behavior, not a live performance benefit.
+
+The original indirect test compiler fails with E_FAIL on the unchanged baseline
+before budget allocation. Test-only a2f78eb03 uses production's DXC fallback and
+source root-signature builder; the existing reset and batch numerical checks
+then run successfully. This compatibility fix is separate from the pool.
+
+Run 023521 changes only the card-buffer minimum from the old forced 64 KiB to
+the normal 16 MiB for this memory budget, retaining the 512-MiB card-buffer
+cap. The budget pool is off. This tests whether large writable buffers can
+avoid CPU snapshot/compare volume within the same VRAM allowance. It is still
+running at this update; early captures retain missing body/scenery and are not
+a correctness or sustained-FPS success.
+
+The complete fxceless #927 half-buffer series through d4b786fe1 is being adapted
+on perf20/half-views-20261127. Keep the final mixed-access and runtime-table
+exclusions, unsigned descriptor twins, and the fork's grouped tables and
+per-record descriptor cache. Cache FORMAT4/VSH4 separates the new metadata from
+both accepted VSH2 and the rejected root-write experiment's VSH3. Compilation
+and GPU execution are pending; the PR title is not evidence that it fixes this
+machine's missing geometry.
