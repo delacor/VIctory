@@ -2922,10 +2922,11 @@ impl State {
                         }
                     }
                 }
-                (true, Some((slot, offset))) => {
-                    let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(*slot)) else { continue };
-                    if let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + u64::from(*offset) * 4) {
-                        list.capture_pass(resource as This, &format!("{hash}-{phase}-u{slot}-{offset}"));
+                (_, Some((slot, offset))) => {
+                    let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(*slot)) else { continue };
+                    if let Some(View::Shader(resource, _) | View::Unordered(resource, ..)) =
+                        crate::descriptor::view(table + u64::from(*offset) * 4) {
+                        list.capture_pass(resource as This, &format!("{hash}-{phase}-view{slot}-{offset}"));
                     }
                 }
                 _ => {},

@@ -995,7 +995,7 @@ impl PassSnapshot {
 }
 
 /// A hash alone selects graphics color/depth targets; hash/slot/dwords selects
-/// one compute UAV table view. Nothing is captured until folder/pass-now exists.
+/// one graphics/compute texture table view. Capture starts at folder/pass-now.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn pass_specs() -> &'static [(String, Option<(u8, u32)>)] {
     static SPECS: std::sync::OnceLock<Vec<(String, Option<(u8, u32)>)>> = std::sync::OnceLock::new();
