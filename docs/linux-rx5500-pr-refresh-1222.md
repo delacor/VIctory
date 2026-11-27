@@ -170,3 +170,17 @@ experiments, not as a live FPS measurement or GPU hardware floor.
 
 Private game captures stay outside Git. Publishing is handled by another chat,
 per the user's instruction; this thread continues local work only.
+
+
+## Qualified next diagnostic
+
+The optional asynchronous timing PR and its hardware ring-wrap regression are
+now part of this integration (452fb997f/3fdf7edd6), with code identical to the
+tested cd23efdfa tree. The live run has visible scenery, no kernel errors and
+no missing timestamps. The separate bundle feasibility probe also passes its
+visible image comparisons after repairing inherited portable test coverage.
+See [timing, limits and next steps](linux-rx5500-list-timing.md).
+
+The integration retains the four distinct correctness PRs. The normal profile
+continues to use 1,024 MiB of hot buffers, and timing remains off by default.
+The 20 FPS objective is not achieved.
