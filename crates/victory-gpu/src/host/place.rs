@@ -171,6 +171,14 @@ pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::syn
 unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
+        // The recorder forwards enhanced Barrier calls but cannot encode
+        // them yet. Keep in-place copy ordering and record the existing
+        // legacy dependency instead of silently losing it on replay.
+        #[cfg(feature = "diagnostics")]
+        if crate::replay::record::on() {
+            tracing::info!("in-place copies use legacy barriers while recording");
+            return false;
+        }
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
         // SAFETY: a feature structure of its size.
         let known = unsafe {
