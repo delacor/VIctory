@@ -1180,9 +1180,11 @@ fn software_mesh_bundles_and_plain_indirect_draws_preserve_the_image() {
 #[ignore = "requires state-changing indirect/DGC support; run separately from portable Wine profile"]
 fn stateful_indirect_mesh_compute_matches_direct_output() {
     let host = Host::new(false).expect("a hardware SM6.6 device");
-    let (cs, layout) = lowered_with(true, true);
-    let direct = run_compute_signature(&host, &cs, &layout, 2, false, false).unwrap();
-    let stateful = run_compute_signature(&host, &cs, &layout, 2, true, true).unwrap();
-    assert_eq!(stateful, direct);
-    assert!(stateful[2].chunks_exact(4).any(|r| r[2] == 256));
+    lower::with_mesh_export_probe(true, || {
+        let (cs, layout) = lowered_with(true, false);
+        let direct = run_compute_signature(&host, &cs, &layout, 2, false, false).unwrap();
+        let stateful = run_compute_signature(&host, &cs, &layout, 2, true, true).unwrap();
+        assert_eq!(stateful, direct);
+        assert!(stateful[2].chunks_exact(4).any(|r| r[2] == 256));
+    });
 }
