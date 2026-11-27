@@ -347,4 +347,84 @@ mod tests {
         assert_eq!(spans(&[10, 30, 20], &[1, 1]), None);
         assert_eq!(spans(&[10, 20], &[1, 1]), None);
     }
+
+    /// Real queue submissions exercise native command identity, copy ordering,
+    /// fenced reads and query-slot reuse after crossing the entire ring.
+    #[test]
+    #[ignore = "isolated hardware adapter; VICTORY_LIST_STAMPS=1; run alone"]
+    fn hardware_list_stamps_preserve_copies_across_ring_wrap() {
+        assert!(on(), "enable VICTORY_LIST_STAMPS=1 so this cannot pass as a no-op");
+        let host = host().expect("a hardware D3D12 adapter");
+        let (upload, src) = host.shared_buffer(256).expect("mapped source");
+        let intermediate = host.uav_buffer(256).expect("intermediate");
+        let readback = host.read_back_buffer(256).expect("readback");
+        let producer = host.new_list().unwrap();
+        let consumer = host.new_list().unwrap();
+        // SAFETY: all resources, native lists and allocators remain owned
+        // through every fence below; the CPU only touches completed data.
+        unsafe {
+            let desc = host.adapter.as_ref().expect("DXGI adapter").GetDesc2().unwrap();
+            assert_eq!(desc.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            eprintln!("LIST_STAMPS hardware adapter: {}", String::from_utf16_lossy(&desc.Description).trim_end_matches(char::from(0)));
+            producer.list.ResourceBarrier(&[transition(&intermediate, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            producer.list.CopyBufferRegion(&intermediate, 0, &upload, 0, 256);
+            producer.list.ResourceBarrier(&[transition(&intermediate, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            consumer.list.CopyBufferRegion(&readback, 0, &intermediate, 0, 256);
+            consumer.list.ResourceBarrier(&[transition(&intermediate, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            producer.close();
+            consumer.close();
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wrapped = false;
+            let mut previous_next = 0;
+            for round in 0u32..=1536 {
+                let expected: [u32; 64] = std::array::from_fn(|i| (round * 0x10001).wrapping_add(i as u32 * 37));
+                std::ptr::copy_nonoverlapping(expected.as_ptr(), src.cast::<u32>(), 64);
+                let mut lists = vec![
+                    Some(producer.list.cast::<ID3D12CommandList>().unwrap()),
+                    Some(consumer.list.cast::<ID3D12CommandList>().unwrap()),
+                ];
+                let mut firsts = [0, 1];
+                if round != 0 {
+                    put(&mut lists, &[(0, Timed::Prelude), (1, Timed::Other)], &mut firsts).expect("free timestamp slots");
+                    assert_eq!(firsts, [0, 2]);
+                    assert_eq!(lists.len(), 5, "three stamps retain both original lists");
+                    let next = STATE.lock().unwrap_or_else(|e| e.into_inner()).next;
+                    wrapped |= next < previous_next;
+                    previous_next = next;
+                }
+                *submitted += 1;
+                host.queue.ExecuteCommandLists(&lists);
+                host.queue.Signal(&host.fence, *submitted).unwrap();
+                if round != 0 {
+                    sent(*submitted);
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while host.fence.GetCompletedValue() < *submitted {
+                    assert!(std::time::Instant::now() < deadline, "GPU copy or timestamp submission did not complete");
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                let got = mapped.cast::<[u32; 64]>().read_volatile();
+                assert_eq!(got, expected, "all copy bytes must match, round {round}");
+                if round != 0 {
+                    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    read(&mut state, stamps().unwrap());
+                    assert_eq!(state.in_use, 0);
+                    assert!(state.pending.is_empty());
+                }
+            }
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(wrapped, "the test must actually reuse slots after a full ring");
+            assert_eq!(state.sums.submissions, 1536);
+            assert_eq!(state.sums.unread, 0);
+            assert_eq!(state.sums.left_out, 0);
+            assert_eq!(state.sums.runs, [1536, 0, 0, 0, 1536]);
+            assert!(state.sums.ticks.iter().sum::<u64>() > 0);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+            readback.Unmap(0, None);
+            upload.Unmap(0, None);
+            eprintln!("LIST_STAMPS 1536 stamped submissions plus unstamped baseline: all 98368 dwords match, ring wrapped, no missing or reversed timestamps");
+        }
+    }
 }
