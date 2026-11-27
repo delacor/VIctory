@@ -254,6 +254,27 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Diagnostic dispositions of reusable host lists; no ownership changes.
+#[cfg(windows)]
+fn pool_event(which: usize) {
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        static EVENTS: AtomicU64 = AtomicU64::new(0);
+        COUNTS[which].fetch_add(1, Relaxed);
+        let events = EVENTS.fetch_add(1, Relaxed) + 1;
+        if events.is_multiple_of(10_000) {
+            let c = COUNTS.each_ref().map(|v| v.load(Relaxed));
+            tracing::info!(events, reused=c[0], fresh=c[1], recycled=c[2],
+                not_ran=c[3], retired=c[4], count_cap=c[5], byte_cap=c[6],
+                "host list pool dispositions");
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = which;
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -267,8 +288,8 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => { pool_event(0); Some(list) },
+        None => { pool_event(1); crate::host::host().and_then(|h| h.new_list().ok()) },
     }
 }
 
@@ -301,7 +322,10 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || host.should_retire() || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_idle {
+        if !ran.contains(&i) { pool_event(3); continue; }
+        if host.should_retire() { pool_event(4); continue; }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_idle {
+            pool_event(5);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -309,10 +333,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < max_idle && idle.1 + bytes <= IDLE_MOST_BYTES {
+        let disposition = if idle.0.len() >= max_idle { 5 } else if idle.1 + bytes > IDLE_MOST_BYTES { 6 } else { 2 };
+        if disposition == 2 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
+        drop(idle);
+        pool_event(disposition);
     }
 }
 

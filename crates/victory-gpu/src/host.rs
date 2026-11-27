@@ -4488,7 +4488,10 @@ impl Host {
     }
 
     /// A new list, open for recording.
+    #[track_caller]
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        #[cfg(feature = "diagnostics")]
+        buffer_allocation_caller("host-list", std::panic::Location::caller(), 0);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
