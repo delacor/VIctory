@@ -3408,6 +3408,43 @@ mod tests {
     use crate::object::slot;
 
     #[test]
+    fn packed_rgba4_layout_agrees_with_the_d3d12_copy_footprint() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            eprintln!("D3D12 unavailable; format191 footprint check skipped");
+            return;
+        };
+        let format = victory_formats::texture::format(191).expect("A4B4G4R4 layout");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 3,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(191),
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1, Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut total) = (0, 0, 0);
+        // SAFETY: a plain runtime layout query with initialized output storage.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc, 0, 1, 0, Some(&mut footprint), Some(&mut rows),
+                Some(&mut row_bytes), Some(&mut total),
+            );
+        }
+        assert_eq!((rows, row_bytes), (2, 6), "the runtime's 16-bit format footprint");
+        assert_eq!(u64::from(format.bytes) * desc.Width, row_bytes);
+        assert_eq!(element(191), Some((row_bytes / desc.Width, 1)));
+        assert_eq!(total, u64::from(footprint.Footprint.RowPitch) + row_bytes);
+        eprintln!("format191: rows={rows}, row_bytes={row_bytes}, total={total}");
+    }
+
+    #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
         // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
