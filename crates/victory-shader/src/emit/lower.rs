@@ -149,6 +149,23 @@ const GS_ALLOC_REQ: u16 = 9;
 /// Mesh output UAV registers (in [`super::shader::MESH_OUT_SPACE`]).
 const MESH_VERTICES: u8 = 0;
 const MESH_INDICES: u8 = 1;
+
+// A translation-scoped diagnostic. The normal output layout is unchanged.
+thread_local! {
+    static MESH_EXPORT_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) fn mesh_export_probe() -> bool {
+    MESH_EXPORT_PROBE.with(std::cell::Cell::get)
+}
+pub(super) fn with_mesh_export_probe<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { MESH_EXPORT_PROBE.set(self.0); }
+    }
+    let _restore = Restore(MESH_EXPORT_PROBE.replace(enabled));
+    f()
+}
+
 const MESH_PRIMITIVES: u8 = 2;
 /// `s_sendmsg` id that ends a pixel wave's ordered section.
 const ORDERED_PS_DONE: u16 = 7;
@@ -5289,6 +5306,9 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             if self.s.mesh_as_compute {
                 self.mesh_out_store(MESH_INDICES, index, &[z, z, z]);
+                if self.s.prims.is_empty() && mesh_export_probe() {
+                    self.mesh_out_store(MESH_PRIMITIVES, index, &[z, z, z, z]);
+                }
             } else {
                 self.s.op(
                     self.cur,
@@ -5312,7 +5332,11 @@ impl<'a> Lower<'a> {
         let (per_group, record) = match out {
             MESH_VERTICES => (mesh.max_vertices, 4 * self.s.outputs.len() as u32),
             MESH_INDICES => (mesh.max_primitives, 3),
-            _ => (mesh.max_primitives, 4 * self.s.prims.len() as u32),
+            _ => (mesh.max_primitives, if self.s.prims.is_empty() && mesh_export_probe() {
+                4
+            } else {
+                4 * self.s.prims.len() as u32
+            }),
         };
         let c = self.cur;
         let g = self.mesh_group_id();
@@ -13215,6 +13239,22 @@ impl<'a> Lower<'a> {
         } else {
             guard
         };
+        let probe = self.s.mesh_as_compute && self.s.prims.is_empty() && mesh_export_probe();
+        if probe {
+            // Record EXEC separately from the packed export. An inactive lane's
+            // source may be undefined, so it must not be observed.
+            let z = self.s.m.i32(0);
+            let one = self.s.m.i32(1);
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let raw = self.s.m.select(self.cur, active, x, z);
+            let active = self.s.m.select(self.cur, active, one, z);
+            let marker = self.s.m.i32(128);
+            let bound = self.s.m.i32(self.s.mesh.expect("mesh").max_primitives);
+            let inside = self.s.m.cmp(self.cur, pred::IULT, flat, bound);
+            let at = self.begin_guarded(Some(inside));
+            self.mesh_out_store(MESH_PRIMITIVES, flat, &[raw, active, marker, flat]);
+            self.end_guarded(at, &[]);
+        }
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
@@ -13248,6 +13288,14 @@ impl<'a> Lower<'a> {
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
             }
             indices.push(i);
+        }
+        if probe {
+            let one = self.s.m.i32(1);
+            let zero = self.s.m.i32(0);
+            let culled = self.s.m.select(c, culled, one, zero);
+            let marker = self.s.m.i32(256);
+            let marker = self.s.m.bin(c, Bin::Or, marker, culled);
+            self.mesh_out_store(MESH_PRIMITIVES, flat, &[x, one, marker, flat]);
         }
         for i in &mut indices {
             if let Some(first) = first {

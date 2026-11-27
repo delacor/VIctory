@@ -221,7 +221,9 @@ fn lowered_native(as_compute: bool, prims: bool, native: NativeProgram) -> (Host
         max_vertices: mesh.max_vertices,
         max_primitives: mesh.max_primitives,
         vertex_dwords: 4 * outputs.len() as u32,
-        primitive_dwords: 4 * prim_outputs(prims).len() as u32,
+        primitive_dwords: if !prims && lower::mesh_export_probe() { 4 } else {
+            4 * prim_outputs(prims).len() as u32
+        },
     };
     (s, layout)
 }
@@ -552,6 +554,13 @@ fn run_compute(
     layout: &MeshLayout,
     groups: u32,
 ) -> Result<[Vec<u32>; 2], String> {
+    let [vertices, indices, _] = run_compute_all(host, cs, layout, groups)?;
+    Ok([vertices, indices])
+}
+
+fn run_compute_all(
+    host: &Host, cs: &HostShader, layout: &MeshLayout, groups: u32,
+) -> Result<[Vec<u32>; 3], String> {
     let gpu = Gpu::new(host)?;
     let pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
     let outs = gpu.mesh_buffers(layout, groups)?;
@@ -584,6 +593,7 @@ fn run_compute(
     Ok([
         Gpu::read(&readbacks[0], sizes[0] as usize / 4)?,
         Gpu::read(&readbacks[1], sizes[1] as usize / 4)?,
+        Gpu::read(&readbacks[2], sizes[2] as usize / 4)?,
     ])
 }
 
@@ -958,4 +968,30 @@ fn compare_with_the_mesh_shader(prims: bool) {
         same_image(&native, image, tolerance)
             .unwrap_or_else(|e| panic!("{ref_label} mesh vs {label} fallback: {e}"));
     }
+}
+
+
+/// Debug records must describe the native packed export without changing
+/// the actual triangle stream. The scoped flag must not leak to other shaders.
+#[test]
+fn mesh_export_probe_reports_raw_culling_and_preserves_indices() {
+    let host = Host::new(false).expect("a hardware SM 6.6 device");
+    lower::with_mesh_export_probe(true, || {
+        let (cs, layout) = lowered(true);
+        assert_eq!(layout.primitive_dwords, 4);
+        let [_, indices, records] = run_compute_all(&host, &cs, &layout, 2).unwrap();
+        assert_eq!(indices, [0,1,2, 0,0,0, 0,0,0, 3,4,5, 0,0,0, 0,0,0]);
+        let mut expected = Vec::new();
+        for _group in 0..2 {
+            for lane in 0u32..3 {
+                let packed = 0x0020_0400u32.wrapping_add(lane.wrapping_mul(0x7FDF_FC00));
+                let corners = [packed & 0x1ff, (packed >> 10) & 0x1ff, (packed >> 20) & 0x1ff];
+                let culled = packed & 0x8000_0000 != 0 || corners.iter().any(|&v| v >= 3);
+                expected.extend([packed, 1, 256 | u32::from(culled), lane]);
+            }
+        }
+        assert_eq!(records, expected);
+    });
+    assert!(!lower::mesh_export_probe());
+    assert_eq!(lowered(true).1.primitive_dwords, 0);
 }

@@ -487,7 +487,9 @@ pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, Shade
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_mesh_as_compute(&c, &native, &p, &st, &io, &res)
+    let probe = cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_MESH_EXPORT_PROBE").is_some_and(|v| v == "1");
+    lower::with_mesh_export_probe(probe, || emit_mesh_as_compute(&c, &native, &p, &st, &io, &res))
 }
 
 /// [`translate_mesh_as_compute`] for a program whose earlier stages already
@@ -512,7 +514,11 @@ pub fn emit_mesh_as_compute(
         max_vertices: ms.max_vertices,
         max_primitives: ms.max_primitives,
         vertex_dwords: 4 * outputs.len() as u32,
-        primitive_dwords: 4 * prims.len() as u32,
+        primitive_dwords: if prims.is_empty() && lower::mesh_export_probe() {
+            4
+        } else {
+            4 * prims.len() as u32
+        },
     };
     Ok(MeshFallback {
         compute,
