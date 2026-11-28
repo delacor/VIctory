@@ -2233,18 +2233,23 @@ impl<'a> Tracer<'a> {
         {
             return None;
         }
-        // Read nowhere else: made the lane's own, a first-lane value must
-        // not reach code past the loop, which would see the last pass's.
+        // A first-lane offset AND its loaded uniform descriptor must not
+        // escape. Outside the loop the console sees the final pass's scalar
+        // descriptor, whereas folding makes each lane use its own entry.
+        let mut uniform = out.reads.clone();
+        for &load in loads {
+            uniform.extend(self.inst(load).writes.iter().map(|(_, v)| *v));
+        }
         for (ob, other) in self.p.blocks.iter().enumerate() {
             let carried = other
                 .phis
                 .iter()
-                .any(|p| p.args.iter().any(|a| out.reads.contains(a)));
+                .any(|p| p.args.iter().any(|a| uniform.contains(a)));
             let read_there = ob != b
                 && other
                     .insts
                     .iter()
-                    .any(|inst| inst.reads.iter().any(|(_, v)| out.reads.contains(v)));
+                    .any(|inst| inst.reads.iter().any(|(_, v)| uniform.contains(v)));
             if carried || read_there {
                 return None;
             }
@@ -3501,6 +3506,19 @@ pub(crate) mod tests {
         assert!(by_shape(&words, false).is_none());
         let words = indexed_with(true, &[(0xBE98_047E, 0xBE98_04C1)]); // s_mov_b64 s[24:25], -1
         assert!(by_shape(&words, true).is_none());
+    }
+
+    #[test]
+    fn a_uniform_descriptor_read_after_its_loop_is_none_by_shape() {
+        for wave64 in [false, true] {
+            // Read s12, a dword of the descriptor loaded in the final loop pass.
+            // Its first-lane offset is not itself read after the loop.
+            let words = indexed_with(
+                wave64,
+                &[(0xE070_1000, 0x7E28_020C), (0x800A_0C10, 0xBF80_0000)],
+            );
+            assert!(by_shape(&words, wave64).is_none(), "wave64 {wave64}: uniform descriptor escaped");
+        }
     }
 
     #[test]
