@@ -294,18 +294,22 @@ fn watch_large() -> bool {
 }
 
 /// Reserves a large block so the kernel can report which pages were written.
+/// Uses [`address_range`] so 64-bit allocations stay out of the low 4 GiB
+/// reserved for 32-bit requests and within the 64-bit upper bound.
 /// The GPU rounds its write-watch queries out to 64 KiB boundaries.
 fn watched_reservation(layout: Layout) -> *mut c_void {
     let large_align = layout.align() > PAGE;
+    let (lowest, highest) = address_range(0);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-        Alignment: layout.align(),
-        ..Default::default()
+        LowestStartingAddress: lowest as *mut c_void,
+        HighestEndingAddress: highest as *mut c_void,
+        Alignment: if large_align { layout.align() } else { 0 },
     };
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
-    // SAFETY: the host chooses the address; the alignment parameter, when
-    // used, points to `requirements` for the duration of the call.
+    // SAFETY: the host chooses an address within `requirements`, which
+    // outlives the call via `parameter`.
     unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
@@ -313,8 +317,8 @@ fn watched_reservation(layout: Layout) -> *mut c_void {
             layout.size().next_multiple_of(PAGE),
             MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
             PAGE_READWRITE,
-            if large_align { &mut parameter } else { std::ptr::null_mut() },
-            large_align.into(),
+            &mut parameter,
+            1,
         )
     }
 }
@@ -2115,6 +2119,8 @@ mod tests {
 
         let size = MIB + 17;
         let watched = std::env::var_os("VICTORY_WATCH_LARGE_XMEM").is_none_or(|v| v != "0");
+        let (lowest, highest) = address_range(0);
+        assert!(lowest >= 1 << 32);
         for (field, align) in [(0, 16), (16, 64 << 10), (21, 2 * MIB)] {
             let attributes = field << ALIGNMENT_SHIFT;
             let p = XMemAllocDefault(size, attributes);
@@ -2138,6 +2144,10 @@ mod tests {
 
             let base = query(p).host.AllocationBase;
             assert_eq!(header.reservation, base);
+            let reserved = header.layout.size().next_multiple_of(PAGE);
+            assert!(base as usize >= lowest && base as usize >= 1 << 32, "field {field:#x} base {base:p}");
+            assert!(base as usize + reserved - 1 <= highest, "field {field:#x} base {base:p}");
+            assert!(p as usize >= lowest && p as usize + size - 1 <= highest, "field {field:#x} p {p:p}");
             assert!(p as usize - HEADER >= base as usize, "field {field:#x}");
             // Ask over the same 64 KiB boundaries as the GPU's write watch.
             let last = p as usize + size - 1;
