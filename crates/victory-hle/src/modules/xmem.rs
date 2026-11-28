@@ -2174,6 +2174,67 @@ mod tests {
     }
 
     #[test]
+    fn large_default_allocations_keep_sparse_writes_across_watch_resets() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch, MEM_FREE};
+
+        let size = MIB + 17;
+        for field in [0, 16, 21] {
+            let attributes = field << ALIGNMENT_SHIFT;
+            let p = XMemAllocDefault(size, attributes);
+            assert!(!p.is_null());
+            // SAFETY: the allocation carries our header.
+            let header = unsafe { p.cast::<u8>().sub(HEADER).cast::<AllocHeader>().read() };
+            let watched = !header.reservation.is_null();
+            assert_eq!(watched, watch_large());
+            let reserved = header.layout.size().next_multiple_of(PAGE);
+            let offsets = [0, 7 * 4096 + 19, size - 1];
+            for round in 0..8usize {
+                if watched {
+                    // SAFETY: this is the complete live private reservation.
+                    assert_eq!(unsafe { ResetWriteWatch(header.reservation, reserved) }, 0);
+                }
+                let barrier = std::sync::Barrier::new(offsets.len());
+                std::thread::scope(|scope| {
+                    for (i, offset) in offsets.into_iter().enumerate() {
+                        let address = p as usize + offset;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            // SAFETY: distinct live allocation bytes, with no concurrent reader.
+                            unsafe { (address as *mut u8).write_volatile((round * 17 + i) as u8) };
+                        });
+                    }
+                });
+                for (i, offset) in offsets.into_iter().enumerate() {
+                    // SAFETY: workers have joined and these bytes are live.
+                    assert_eq!(unsafe { p.cast::<u8>().add(offset).read_volatile() }, (round * 17 + i) as u8);
+                }
+                if watched {
+                    let mut pages = vec![std::ptr::null_mut(); reserved / 4096];
+                    let mut count = pages.len();
+                    let mut granularity = 0;
+                    // SAFETY: the output has room for count addresses.
+                    let result = unsafe {
+                        GetWriteWatch(0, header.reservation, reserved, pages.as_mut_ptr(), &mut count, &mut granularity)
+                    };
+                    assert_eq!(result, 0);
+                    assert_eq!(granularity, 4096);
+                    let mut expected: Vec<usize> = offsets.into_iter().map(|o| (p as usize + o) & !4095).collect();
+                    expected.sort_unstable();
+                    expected.dedup();
+                    let mut actual: Vec<usize> = pages[..count].iter().map(|p| *p as usize).collect();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "field {field}, round {round}");
+                }
+            }
+            XMemFreeDefault(p, attributes);
+            if watched {
+                assert_eq!(query(header.reservation).host.State, MEM_FREE);
+            }
+        }
+    }
+
+    #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;
         let p = XMemVirtualAlloc(
