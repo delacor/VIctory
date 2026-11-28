@@ -385,6 +385,8 @@ impl std::ops::Deref for GraphicsTarget<'_> {
 pub(crate) struct State {
     pipeline: usize,
     mesh_window: Option<crate::mesh_window::Window>,
+    mesh_texture_draw: Option<crate::mesh_texture_window::Draw>,
+    mesh_texture_generation: u64,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -465,6 +467,18 @@ impl Drop for State {
 
 impl State {
     pub(crate) fn flush_mesh(&mut self, list: &HostList) {
+        // Only an unfinished/failed call can leave a current open bundle.
+        self.mesh_texture_draw.take();
+        let previous = list.texture_mesh_generation.load(Ordering::Acquire);
+        crate::mesh_texture_window::flush(list);
+        let changed = previous != list.texture_mesh_generation.load(Ordering::Acquire);
+        if crate::mesh_texture_window::enabled() {
+            list.mesh_scratch_recycle();
+        }
+        if changed {
+            self.external_compute();
+            self.set_topology(list, self.topology);
+        }
         if let Some(window) = self.mesh_window.take() {
             if let Err(e) = window.finish(list) {
                 crate::host::fail(format_args!("a mesh graphics window could not close ({e})"));
@@ -476,6 +490,21 @@ impl State {
 
     fn begin_mesh_window(&mut self, list: &HostList, p: &HostPipeline,
         f: &crate::pipeline::host::MeshFallback, bytes: u64) -> bool {
+        if crate::mesh_texture_window::enabled() && !f.window_readonly
+            && f.window_texture_readonly && mesh_test() == 0
+            && f.signatures.as_ref().is_some_and(|s| s.portable)
+            && bytes != 0 && bytes <= crate::mesh_window::STRIDE
+        {
+            if self.mesh_window.is_some() { self.flush_mesh(list); }
+            self.mesh_texture_draw.take();
+            self.mesh_texture_draw = crate::mesh_texture_window::reserve(list, p.pso.as_raw() as usize, self.heaps, bytes);
+            if self.mesh_texture_draw.is_some() { return true; }
+            self.flush_mesh(list);
+            return false;
+        }
+        if list.texture_mesh_pending.load(Ordering::Acquire) || self.mesh_texture_draw.is_some() {
+            self.flush_mesh(list);
+        }
         let eligible = crate::mesh_window::enabled() && f.window_readonly
             && bytes != 0 && bytes <= crate::mesh_window::STRIDE
             && mesh_test() == 0 && f.signatures.as_ref().is_some_and(|s| s.portable);
@@ -497,11 +526,77 @@ impl State {
     }
 
     fn graphics_target<'a>(&self, list: &'a HostList) -> GraphicsTarget<'a> {
+        if let Some(draw) = &self.mesh_texture_draw {
+            return GraphicsTarget::Bundle(draw.bundle.clone());
+        }
         match &self.mesh_window {
             Some(window) => GraphicsTarget::Bundle(window.bundle.clone()),
             None => GraphicsTarget::Direct(&list.list),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_begin(&mut self, list: &HostList, pipeline: usize, bytes: u64) -> crate::host::ScratchRegion {
+        self.mesh_texture_draw.take();
+        self.mesh_texture_draw = crate::mesh_texture_window::reserve(list, pipeline, [0;2], bytes);
+        self.mesh_window_region(bytes).expect("full-capacity texture draw region")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_graphics(&self, list: &HostList) -> ID3D12GraphicsCommandList {
+        match self.graphics_target(list) {
+            GraphicsTarget::Bundle(bundle) => bundle,
+            GraphicsTarget::Direct(_) => panic!("test expects a graphics bundle"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_heap(&mut self, heap: &ID3D12DescriptorHeap) {
+        self.mesh_texture_draw.as_mut().unwrap().descriptor_heaps = vec![Some(heap.clone())];
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_finish(&mut self, list: &HostList, command: &ID3D12Resource) {
+        self.finish_texture_mesh(list, true, Some(command));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_bind(&mut self, list: &HostList,
+        pso: &ID3D12PipelineState, root: &ID3D12RootSignature, compute: bool) {
+        let pipeline = HostPipeline {
+            compute: false, mesh: true, fallback: None, pso: pso.clone(), root: root.clone(),
+            stages: Vec::new(), slots: 0, inputs: Vec::new(), rects: false,
+            name: "textured mesh native cache probe".to_owned(), state: String::new(),
+        };
+        assert!(self.bind_as(list, &pipeline, pso, &[], compute, compute));
+    }
+
+    fn mesh_window_region(&mut self, bytes: u64) -> Option<crate::host::ScratchRegion> {
+        match &self.mesh_texture_draw {
+            Some(draw) if bytes <= crate::mesh_window::STRIDE => Some(draw.region()),
+            Some(_) => None,
+            None => self.mesh_window.as_mut().and_then(|w| w.reserve(bytes)),
+        }
+    }
+
+    fn mesh_work_pending(&self, list: &HostList) -> bool {
+        self.mesh_window.is_some() || self.mesh_texture_draw.is_some()
+            || list.texture_mesh_pending.load(Ordering::Acquire)
+    }
+
+    fn finish_texture_mesh(&mut self, list: &HostList, drawn: bool, commands: Option<&ID3D12Resource>) {
+        if let Some(draw) = self.mesh_texture_draw.take() {
+            draw.commit(list, drawn, commands, self.heaps);
+        }
+    }
+
+    fn sync_mesh_bindings(&mut self, list: &HostList) -> bool {
+        let generation = list.texture_mesh_generation.load(Ordering::Acquire);
+        if generation == self.mesh_texture_generation { return false; }
+        self.mesh_texture_generation = generation;
+        self.external_compute();
+        true
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -1078,7 +1173,7 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
-        if self.mesh_window.is_some() && self.topology_set && self.topology == topology { return; }
+        if self.mesh_work_pending(list) && self.topology_set && self.topology == topology { return; }
         self.flush_mesh(list);
         self.topology = topology;
         self.topology_set = true;
@@ -1252,7 +1347,7 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-        if self.mesh_window.is_some() && self.viewports == viewports { return; }
+        if self.mesh_work_pending(list) && self.viewports == viewports { return; }
         self.flush_mesh(list);
         #[cfg(feature = "diagnostics")]
         if let Some(v) = viewports.first() {
@@ -1264,7 +1359,7 @@ impl State {
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
-        if self.mesh_window.is_some() && self.scissors == rects { return; }
+        if self.mesh_work_pending(list) && self.scissors == rects { return; }
         self.flush_mesh(list);
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
@@ -1285,21 +1380,21 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
-        if self.mesh_window.is_some() && self.blend.as_ref() == factor { return; }
+        if self.mesh_work_pending(list) && self.blend.as_ref() == factor { return; }
         self.flush_mesh(list);
         self.blend = factor.copied();
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
-        if self.mesh_window.is_some() && self.stencil == Some(reference) { return; }
+        if self.mesh_work_pending(list) && self.stencil == Some(reference) { return; }
         self.flush_mesh(list);
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
-        if self.mesh_window.is_some() && self.depth_bounds == Some([min, max]) { return; }
+        if self.mesh_work_pending(list) && self.depth_bounds == Some([min, max]) { return; }
         self.flush_mesh(list);
         self.depth_bounds = Some([min, max]);
         crate::draw::depth_bounds(list, min, max);
@@ -1608,6 +1703,34 @@ impl State {
     }
 
     fn bind_as(
+        &mut self, list: &HostList, p: &HostPipeline,
+        pso: &ID3D12PipelineState, stages: &[crate::pipeline::host::Stage],
+        roots: bool, compute: bool,
+    ) -> bool {
+        if !crate::mesh_texture_window::enabled() {
+            return self.bind_as_once(list, p, pso, stages, roots, compute);
+        }
+        loop {
+            self.sync_mesh_bindings(list);
+            if !compute && self.mesh_texture_draw.as_ref().is_some_and(|d| !d.graphics_initialized) {
+                // Every per-call bundle sets its own complete binding state.
+                self.external_compute();
+            }
+            if !self.bind_as_once(list, p, pso, stages, roots, compute) { return false; }
+            if self.sync_mesh_bindings(list) {
+                // Texture preparation executed older bundles on the parent,
+                // which can change its PSO/heaps. Repeat bindings after that
+                // mutation; no old pending bundle remains to flush again.
+                continue;
+            }
+            if !compute && let Some(draw) = &mut self.mesh_texture_draw {
+                draw.graphics_initialized = true;
+            }
+            return true;
+        }
+    }
+
+    fn bind_as_once(
         &mut self,
         list: &HostList,
         p: &HostPipeline,
@@ -1672,6 +1795,9 @@ impl State {
                 // SAFETY: an open list and shader-visible heaps.
                 unsafe { l.SetDescriptorHeaps(&heaps) };
             }
+            if !compute && let Some(draw) = &mut self.mesh_texture_draw {
+                draw.descriptor_heaps = heaps.clone();
+            }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
             self.host_roots = [0; 2];
@@ -1710,6 +1836,8 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, pso, root_sig);
         }
+        #[cfg(test)]
+        list.texture_mesh_test_during_bind(compute);
         for stage in stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -3409,14 +3537,16 @@ impl State {
         // Bind before taking a region so a failed bind does not consume the
         // chunk's first-use transition.
         if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+            self.finish_texture_mesh(list, false, None);
             return false;
         }
         let region = if windowed {
-            self.mesh_window.as_mut().and_then(|w| w.reserve(at_prims + prims.max(16)))
+            self.mesh_window_region(at_prims + prims.max(16))
         } else {
             list.mesh_scratch(ScratchPool::Data, at_prims + prims.max(16))
         };
         let Some(region) = region else {
+            self.finish_texture_mesh(list, false, None);
             return false;
         };
         list.keep(&region.buffer);
@@ -3464,6 +3594,7 @@ impl State {
             barriers.between(&region.buffer, Access::Vertices, Access::Compute);
             list.mesh_scratch_recycle();
         }
+        self.finish_texture_mesh(list, drawn, None);
         drawn
     }
     fn indirect_mesh_fallback(
@@ -3502,13 +3633,14 @@ impl State {
             false
         };
         let data = if windowed {
-            self.mesh_window.as_mut().and_then(|w| w.reserve(regions.bytes))
+            self.mesh_window_region(regions.bytes)
         } else {
             list.mesh_scratch(ScratchPool::Data, regions.bytes)
         };
         let (Some(data), Some(commands)) = (
             data, list.mesh_scratch(ScratchPool::Commands, commands_len),
         ) else {
+            self.finish_texture_mesh(list, false, None);
             return false;
         };
         list.keep(&data.buffer);
@@ -3629,6 +3761,8 @@ impl State {
         barriers.between(&commands.buffer, Access::Arguments, Access::Compute);
         if let Some(window) = &mut self.mesh_window {
             window.commands(&commands.buffer);
+        } else if self.mesh_texture_draw.is_some() {
+            self.finish_texture_mesh(list, drawn, Some(&commands.buffer));
         } else {
             list.mesh_scratch_recycle();
         }

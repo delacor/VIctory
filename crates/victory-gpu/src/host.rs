@@ -1407,6 +1407,12 @@ pub(crate) struct HostList {
     /// (see [`HostList::mesh_scratch`]), reused after a reset.
     mesh_scratch: Mutex<MeshScratch>,
     pub(crate) mesh_bundles: Mutex<crate::mesh_window::Pool>,
+    pub(crate) texture_mesh_pool: OnceLock<std::sync::Arc<Mutex<crate::mesh_window::Pool>>>,
+    pub(crate) texture_mesh_batch: Mutex<Option<crate::mesh_texture_window::Batch>>,
+    pub(crate) texture_mesh_pending: std::sync::atomic::AtomicBool,
+    pub(crate) texture_mesh_generation: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    texture_mesh_bind_probe: Mutex<Option<(bool, Box<dyn FnOnce(&HostList) + Send>)>>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -4599,6 +4605,12 @@ impl Host {
                 scratch: Mutex::default(),
                 mesh_scratch: Mutex::default(),
                 mesh_bundles: Mutex::default(),
+                texture_mesh_pool: OnceLock::new(),
+                texture_mesh_batch: Mutex::default(),
+                texture_mesh_pending: std::sync::atomic::AtomicBool::new(false),
+                texture_mesh_generation: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                texture_mesh_bind_probe: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6858,6 +6870,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::mesh_texture_window::flush(self);
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
@@ -6914,6 +6927,15 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // Abandon unsubmitted deferred bundles; submitted ones were flushed
+        // at close. No commands from an abandoned recording are executed.
+        self.texture_mesh_batch.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.texture_mesh_pending.store(false, Ordering::Release);
+        if let Some(pool) = self.texture_mesh_pool.get()
+            && let Err(e) = pool.lock().unwrap_or_else(|e| e.into_inner()).reset()
+        {
+            fail(format_args!("a completed textured mesh bundle pool could not reset ({e})"));
+        }
         if let Err(e) = self.mesh_bundles.lock().unwrap_or_else(|e| e.into_inner()).reset() {
             fail(format_args!("a completed mesh bundle allocator could not reset ({e})"));
         }
@@ -7029,6 +7051,11 @@ impl HostList {
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_for(copy.flags(), wanted);
+        if crate::mesh_texture_window::enabled() {
+            let changes = self.states.lock().unwrap_or_else(|e| e.into_inner())
+                .get(&(std::sync::Arc::as_ptr(&copy) as usize)).is_some_and(|s| s.1 != wanted);
+            if changes { crate::mesh_texture_window::before_texture_change(self); }
+        }
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -7110,6 +7137,11 @@ impl HostList {
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
+        if crate::mesh_texture_window::enabled() {
+            let changes = self.states.lock().unwrap_or_else(|e| e.into_inner())
+                .get(&(std::sync::Arc::as_ptr(copy) as usize)).is_some_and(|s| s.1 != wanted);
+            if changes { crate::mesh_texture_window::before_texture_change(self); }
+        }
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -7226,6 +7258,7 @@ impl HostList {
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         twin: &crate::resource::Twin,
     ) {
+        crate::mesh_texture_window::before_texture_change(self);
         const UNORDERED_ACCESS: u32 = 0x8;
         const DEPTH_WRITE: u32 = 0x10;
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
@@ -7245,6 +7278,7 @@ impl HostList {
         twin: &crate::resource::Twin,
         colour: bool,
     ) {
+        crate::mesh_texture_window::before_texture_change(self);
         const UNORDERED_ACCESS: u32 = 0x8;
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -8033,6 +8067,15 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_mesh_test_during_bind(&self, compute: bool) {
+        let mut hook = self.texture_mesh_bind_probe.lock().unwrap_or_else(|e| e.into_inner());
+        let run = hook.as_ref().is_some_and(|(kind, _)| *kind == compute);
+        let work = if run { hook.take() } else { None };
+        drop(hook);
+        if let Some((_, work)) = work { work(self); }
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -9889,6 +9932,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             liststamps::line(frames);
             crate::shadow::back_line(frames);
+            crate::mesh_texture_window::line(frames);
             #[cfg(feature = "diagnostics")]
             split_line(frames);
             {
@@ -12133,3 +12177,6 @@ mod mesh_scratch {
 
 #[cfg(test)]
 mod upload_placed_tests;
+
+#[cfg(test)]
+mod texture_mesh_tests;

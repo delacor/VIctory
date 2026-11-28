@@ -74,6 +74,8 @@ mod mesh_barriers;
 mod mesh_shared;
 #[cfg(windows)]
 mod mesh_window;
+#[cfg(windows)]
+mod mesh_texture_window;
 pub mod list;
 pub mod object;
 pub mod pipeline;

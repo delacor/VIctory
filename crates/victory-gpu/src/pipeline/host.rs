@@ -402,6 +402,7 @@ pub(crate) struct MeshFallback {
     /// What its indirect mesh dispatches execute (none: they are dropped).
     pub(crate) signatures: Option<crate::mesh_indirect::Signatures>,
     pub(crate) window_readonly: bool,
+    pub(crate) window_texture_readonly: bool,
 }
 
 pub(crate) struct HostPipeline {
@@ -905,6 +906,12 @@ impl HostPipeline {
                     signatures,
                     window_readonly: shaders.iter().all(|s| s.ambient.is_none() && s.probe.is_none()
                         && super::mesh_window_readonly(&s.container)),
+                    window_texture_readonly: shaders.iter().all(|s| s.ambient.is_none() && s.probe.is_none()
+                        && if s.stage == "pixel" {
+                            super::mesh_window_texture_readonly(&s.container)
+                        } else {
+                            super::mesh_window_readonly(&s.container)
+                        }),
                 }),
                 pso,
                 root,

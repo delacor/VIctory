@@ -33,6 +33,7 @@ pub(crate) struct Pool {
     allocator: Option<ID3D12CommandAllocator>,
     lists: Vec<(ID3D12GraphicsCommandList, bool)>,
     used: usize,
+    generation: u64,
 }
 
 // SAFETY: D3D12 bundle objects are free-threaded; Pool is used under
@@ -40,7 +41,7 @@ pub(crate) struct Pool {
 unsafe impl Send for Pool {}
 
 impl Pool {
-    fn acquire(&mut self) -> windows::core::Result<ID3D12GraphicsCommandList> {
+    pub(crate) fn acquire(&mut self) -> windows::core::Result<ID3D12GraphicsCommandList> {
         let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
         // SAFETY: one list records at a time; no allocator reset until fenced.
         unsafe {
@@ -61,11 +62,13 @@ impl Pool {
         }
     }
 
-    fn closed(&mut self, list: &ID3D12GraphicsCommandList) {
+    pub(crate) fn closed(&mut self, list: &ID3D12GraphicsCommandList) {
         let entry = self.lists[..self.used].iter_mut().find(|(l, _)| l.as_raw() == list.as_raw())
             .expect("bundle belongs to this host list");
         entry.1 = false;
     }
+
+    pub(crate) fn generation(&self) -> u64 { self.generation }
 
     pub(crate) fn reset(&mut self) -> windows::core::Result<()> {
         // SAFETY: caller guarantees all submitted work completed. An abandoned
@@ -82,6 +85,7 @@ impl Pool {
             }
         }
         self.used = 0;
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
 }

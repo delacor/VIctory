@@ -2373,6 +2373,11 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    #[cfg(test)]
+    pub(crate) fn test_owned(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new(texture, state))
+    }
+
     /// The bytes backed by card memory, counting only mapped tiles for reserved textures.
     fn card_bytes(&self) -> u64 {
         self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)

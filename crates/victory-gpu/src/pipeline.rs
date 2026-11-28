@@ -433,7 +433,19 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
 /// transfer or hardware-time read. Raster exports and private LDS are local.
 #[cfg(windows)]
 pub(crate) fn mesh_window_readonly(container: &[u8]) -> bool {
-    use victory_shader::gfx10::{Encoding, Fields, decode};
+    mesh_window_reads(container, false)
+}
+
+/// Textures may be read by the pixel half when preparation mutations flush
+/// prior closed bundles. Mesh programs still admit buffer reads only.
+#[cfg(windows)]
+pub(crate) fn mesh_window_texture_readonly(container: &[u8]) -> bool {
+    mesh_window_reads(container, true)
+}
+
+#[cfg(windows)]
+fn mesh_window_reads(container: &[u8], textures: bool) -> bool {
+    use victory_shader::gfx10::decode;
     let Ok(c) = victory_shader::Container::parse(container) else { return false };
     let Some(part) = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))
         else { return false };
@@ -441,14 +453,23 @@ pub(crate) fn mesh_window_readonly(container: &[u8]) -> bool {
     !programs.is_empty() && programs.iter().all(|p| {
         if stores(p) { return false; }
         let Ok(code) = decode(&p.code) else { return false };
-        code.iter().all(|i| {
-            let Some(name) = i.name() else { return false };
-            !matches!(i.encoding, Encoding::Mimg)
-                && !matches!(i.fields(p.wave64), Fields::Ds { gds: true, .. })
-                && !name.contains("memtime") && !name.contains("realtime")
-                && !name.contains("trap")
-        })
+        code.iter().all(|i| mesh_window_instruction_readonly(i, p.wave64, textures))
     })
+}
+
+/// The buffer-store detector deliberately excludes image writes. Admit only
+/// known image reads here; image stores/atomics and BVH instructions stay out.
+#[cfg(windows)]
+fn mesh_window_instruction_readonly(i: &victory_shader::gfx10::Instruction, wave64: bool, textures: bool) -> bool {
+    use victory_shader::gfx10::{Encoding, Fields};
+    let Some(name) = i.name() else { return false };
+    if i.encoding == Encoding::Mimg {
+        return textures && (name.starts_with("image_load")
+            || name.starts_with("image_sample") || name.starts_with("image_gather4")
+            || matches!(name, "image_get_lod" | "image_get_resinfo" | "image_msaa_load"));
+    }
+    !matches!(i.fields(wave64), Fields::Ds { gds: true, .. })
+        && !name.contains("memtime") && !name.contains("realtime") && !name.contains("trap")
 }
 
 /// Whether a console program can store to memory through raw addresses
@@ -970,6 +991,39 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+}
+
+
+#[cfg(all(test, windows))]
+mod mesh_readonly_tests {
+    use super::mesh_window_instruction_readonly;
+    use victory_shader::gfx10::{Encoding, Instruction};
+
+    fn image(opcode: u16) -> Instruction {
+        Instruction::new(0, Encoding::Mimg, opcode, vec![0xf000_0000, 0])
+    }
+
+    #[test]
+    fn textured_mesh_reads_allow_sampling_but_buffer_windows_still_reject_it() {
+        for opcode in [0x000, 0x001, 0x00e, 0x020, 0x02f, 0x040, 0x05f, 0x060, 0x080] {
+            let i = image(opcode);
+            assert!(i.name().is_some());
+            for wave64 in [false, true] {
+                assert!(mesh_window_instruction_readonly(&i, wave64, true), "{i:?}");
+                assert!(!mesh_window_instruction_readonly(&i, wave64, false), "{i:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn textured_mesh_rejects_image_stores_atomics_and_unknown_opcodes() {
+        for opcode in [0x008, 0x009, 0x00a, 0x00b, 0x00f, 0x010, 0x011, 0x01f, 0x1ff] {
+            let i = image(opcode);
+            for wave64 in [false, true] {
+                assert!(!mesh_window_instruction_readonly(&i, wave64, true), "{i:?}");
+            }
         }
     }
 }

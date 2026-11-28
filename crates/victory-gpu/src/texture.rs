@@ -285,6 +285,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
+    crate::mesh_texture_window::before_texture_change(list);
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -1002,6 +1003,7 @@ impl Drop for Claimed {
 /// Records copies of zeros into every subresource of `texture`, which is in
 /// the copy destination state.
 pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12Resource) {
+    crate::mesh_texture_window::before_texture_change(list);
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
@@ -1070,6 +1072,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     if fresh != 0
         && let Some(host) = host()
     {
+        crate::mesh_texture_window::before_texture_change(list);
         const COPY_DEST: u32 = 0x400;
         crate::list::ensure_state(list, resource, COPY_DEST);
         // SAFETY: a live resource.
