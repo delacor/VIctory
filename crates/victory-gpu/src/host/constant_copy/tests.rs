@@ -10,6 +10,16 @@ fn gpu_constants_keep_gpu_writes_cpu_changes_ordering_and_fenced_lifetimes() {
     assert!(on(), "set VICTORY_GPU_CONSTANTS=1");
     let reference = std::env::var_os("GPU_CONSTANT_REFERENCE").is_some();
     let host = host().expect("hardware D3D12 host");
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, DXGI_ADAPTER_FLAG_SOFTWARE};
+    // SAFETY: the selected adapter is live for the host's lifetime.
+    let adapter = unsafe {
+        host.adapter.as_ref().expect("selected adapter")
+            .cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap()
+    };
+    assert_eq!(adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0, "software adapter refused");
+    eprintln!("GPU_CONSTANT_ADAPTER vendor={:#x} device={:#x} software=false", adapter.VendorId, adapter.DeviceId);
+
     const SIDE: usize = 1 << 16;
     const LEN: usize = 512;
     const ROUNDS: usize = 8;
