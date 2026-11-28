@@ -27,10 +27,10 @@ Four fresh-seed 180-second runs complete in off/on/on/off order:
 
 All stop143 and have zero warm compiling. Three kernel intervals are empty; the first enabled run has one compute-ring fence fallback warning, without reset or page fault. The same warning has occurred in unmodified b0 runs and is not unique to this candidate.
 
-Pooled warm log means: off158.705 ms / 6.301 FPS versus on159.686 ms / 6.262 FPS. Mean draws differ1069.1 /1112.0, so this is not an exact causal comparison. There is no reliable FPS gain and no promotion.
+Pooled warm log means: off158.705 ms / 6.301 FPS versus on159.686 ms / 6.262 FPS. Mean draws differ1069.1 /1112.0, so this is not an exact causal comparison. There is no reliable FPS gain. The user requested retaining the change for its substantial copying reduction; it is now kept in the working baseline with that limitation recorded.
 
 The intended copying effect is real. Unwatched whole copies fall34.16→0.34 MB/frame and5.69→0.10 ms/frame. Upload bus traffic falls51.82→31.54 MB/frame; fetched bytes stay70.10/69.86 MB/frame. Total CPU copying falls36.30→33.87 ms and preparation76.69→73.72 ms (means of logged windows). These counters overlap and cannot be added as critical-path savings.
 
-The launcher restored and SHA-verified b0 after both pairs. The qualified source stays isolated for future memory work. A CPU-side copying reduction alone does not establish a local FPS improvement or sustained20FPS.
+The launcher restored and SHA-verified b0 after both pairs. The qualified source is retained on perf20/large-xmem-1630 and selected for further work. A CPU-side copying reduction alone does not establish a local FPS improvement or sustained20FPS.
 
 Local evidence: perf20/largexmem1630-validation.json, largexmem1630-results.json, both run indexes, analysis script and stage logs.
