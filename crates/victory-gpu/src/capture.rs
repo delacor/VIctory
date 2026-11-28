@@ -965,9 +965,26 @@ pub(crate) struct PassSnapshot {
     pub(crate) footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 }
 
+/// Captured lists wait for their submission before saving, with the
+/// submission lock still held. Only bounded diagnostic captures use this.
+/// =0 retains reset-time saving for explicit comparison.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn drain_on_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_PASS_CAPTURE_SUBMIT").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => std::env::var_os("VICTORY_MESH_CAPTURE").is_some() || !pass_specs().is_empty(),
+    })
+}
+
 #[cfg(feature = "diagnostics")]
 impl PassSnapshot {
-    pub(crate) fn save(self) {
+    pub(crate) fn save(self) { self.save_at(None); }
+
+    /// If the same closed list occurs several times in this submission,
+    /// its reused readback contains the final occurrence, not the first.
+    pub(crate) fn save_at(self, completion: Option<(u64, usize)>) {
         let f = self.footprint.Footprint;
         with_readback_bytes(&self.buffer, |rows| {
             // Raw private samples preserve HDR values and avoid comparing
@@ -975,8 +992,10 @@ impl PassSnapshot {
             if let Some(folder) = folder() {
                 let _ = std::fs::write(folder.join(format!("{}.bin", self.name)), rows);
                 let metadata = format!(
-                    "{{\"width\":{},\"height\":{},\"pitch\":{},\"format\":{},\"bytes\":{}}}\n",
+                    "{{\"width\":{},\"height\":{},\"pitch\":{},\"format\":{},\"bytes\":{},\"completion_fence\":{},\"executions_in_submission\":{}}}\n",
                     f.Width, f.Height, f.RowPitch, f.Format.0, rows.len(),
+                    completion.map_or("null".to_owned(), |v| v.0.to_string()),
+                    completion.map_or(0, |v| v.1),
                 );
                 let _ = std::fs::write(folder.join(format!("{}.json", self.name)), metadata);
             }
@@ -1013,8 +1032,10 @@ pub(crate) fn pass_specs() -> &'static [(String, Option<(u8, u32)>)] {
         }).collect())
 }
 
-/// At most twelve images and 64 MiB of readback buffers, for one present
-/// interval per process. Query the actual footprint before reserving bytes.
+/// At most twelve images by default and 64 MiB of payload, for one present
+/// interval per process. Diagnostics may select a later bounded sample with
+/// VICTORY_PASS_CAPTURE_SKIP and increase the count with VICTORY_PASS_CAPTURE_LIMIT.
+/// Query the actual footprint before reserving bytes.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn reserve_pass(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, label: &str) -> Option<String> {
     let mut bytes = 0;
@@ -1026,7 +1047,14 @@ pub(crate) fn reserve_pass(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, la
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn reserve_pass_bytes(label: &str, bytes: u64) -> Option<String> {
-    static STATE: std::sync::Mutex<(Option<u64>, usize, u64)> = std::sync::Mutex::new((None, 0, 0));
+    static STATE: std::sync::Mutex<(Option<u64>, usize, u64, usize)> = std::sync::Mutex::new((None, 0, 0, 0));
+    static POLICY: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let &(skip, limit) = POLICY.get_or_init(|| {
+        let number = |name: &str, default, max| std::env::var(name).ok()
+            .and_then(|s| s.parse::<usize>().ok()).unwrap_or(default).min(max);
+        (number("VICTORY_PASS_CAPTURE_SKIP", 0, 65536),
+         number("VICTORY_PASS_CAPTURE_LIMIT", 12, 4096).max(1))
+    });
     let folder = folder()?;
     let frame = crate::queue::presented() + 1;
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1035,7 +1063,10 @@ pub(crate) fn reserve_pass_bytes(label: &str, bytes: u64) -> Option<String> {
         if std::fs::remove_file(trigger).is_err() { return None }
         state.0 = Some(frame);
     }
-    if state.0 != Some(frame) || state.1 >= 12 { return None }
+    if state.0 != Some(frame) || state.1 >= limit { return None }
+    let seen = state.3;
+    state.3 += 1;
+    if seen < skip { return None }
     if bytes == 0 || state.2.checked_add(bytes)? > 64 << 20 { return None }
     let name = format!("pass-{frame}-{:02}-{label}", state.1);
     state.1 += 1;

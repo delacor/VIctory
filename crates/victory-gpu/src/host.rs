@@ -6010,6 +6010,74 @@ impl Host {
         crate::watch::ask_once(ranges);
     }
 
+    /// Save submitted diagnostic readbacks before any later execution can
+    /// overwrite them. Holding this host's submission lock through both the
+    /// fence and mapping is essential for reusable command lists.
+    #[cfg(feature = "diagnostics")]
+    fn save_submitted_passes(&self, runs: &[&HostList], submitted: &std::sync::MutexGuard<'_, u64>) {
+        if !crate::capture::drain_on_submit() { return; }
+        let mut pending = Vec::new();
+        for &list in runs {
+            let captures = std::mem::take(&mut *list.pass_captures.lock().unwrap_or_else(|e| e.into_inner()));
+            let executions = runs.iter().filter(|&&other| std::ptr::eq(list, other)).count();
+            pending.extend(captures.into_iter().map(|capture| (capture, executions)));
+        }
+        if pending.is_empty() { return; }
+        let target = **submitted;
+        #[cfg(test)]
+        eprintln!("CAPTURE_WAIT target={target} before={} names={:?}", unsafe { self.fence.GetCompletedValue() }, pending.iter().map(|x| &x.0.name).collect::<Vec<_>>());
+        // A dedicated event is essential: setting the normal submission
+        // event for an already-complete fence would leave it signaled, and a
+        // later ordinary wait could return before its GPU work completed.
+        struct CaptureEvent(windows::Win32::Foundation::HANDLE);
+        impl Drop for CaptureEvent {
+            fn drop(&mut self) {
+                // SAFETY: this scope owns the event and consumed its signal.
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
+        // SAFETY: the signal follows every submitted list. This guard
+        // excludes later submissions that could overwrite the readbacks.
+        unsafe {
+            let done = self.fence.GetCompletedValue();
+            if done == u64::MAX || self.device.GetDeviceRemovedReason().is_err() {
+                fail(format_args!("device removed before diagnostic captures completed"));
+            }
+            if done < target {
+                let event = CaptureEvent(CreateEventW(None, false, false, None)
+                    .unwrap_or_else(|e| fail(format_args!("diagnostic capture event not created ({e})"))));
+                if let Err(e) = self.fence.SetEventOnCompletion(target, event.0) {
+                    fail(format_args!("a diagnostic capture fence could not be waited for ({e})"));
+                }
+                let began = std::time::Instant::now();
+                loop {
+                    let status = WaitForSingleObject(event.0, 100);
+                    let done = self.fence.GetCompletedValue();
+                    if done == u64::MAX || self.device.GetDeviceRemovedReason().is_err() {
+                        fail(format_args!("device removed before diagnostic captures completed"));
+                    }
+                    if status == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                        if done < target {
+                            fail(format_args!("diagnostic capture event preceded its GPU fence"));
+                        }
+                        break;
+                    }
+                    if status != windows::Win32::Foundation::WAIT_TIMEOUT {
+                        fail(format_args!("diagnostic capture event wait failed ({status:?})"));
+                    }
+                    if began.elapsed() > std::time::Duration::from_secs(30) {
+                        fail(format_args!("diagnostic captures did not reach their submission fence"));
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        capture_submission_tests::pause_after_completion();
+        for (capture, executions) in pending {
+            capture.save_at(Some((target, executions)));
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -6311,6 +6379,8 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             #[cfg(feature = "diagnostics")]
+            self.save_submitted_passes(runs, &submitted);
+            #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
@@ -6410,6 +6480,8 @@ impl Host {
             }
             let _ = (_i, started);
         }
+        #[cfg(feature = "diagnostics")]
+        self.save_submitted_passes(runs, &submitted);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -6919,7 +6991,13 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         for capture in std::mem::take(&mut *self.pass_captures.lock().unwrap_or_else(|e| e.into_inner())) {
-            capture.save();
+            if crate::capture::drain_on_submit() {
+                // No submission drained this recording: its buffer has no
+                // completed payload and must not masquerade as valid data.
+                tracing::warn!(name = %capture.name, "discarding unsubmitted inline capture");
+            } else {
+                capture.save();
+            }
         }
         self.resets.fetch_add(1, Ordering::Relaxed);
         self.changed_something();
@@ -7068,6 +7146,7 @@ impl HostList {
         let read = crate::capture::read_back(&host.device, &self.list, &copy.texture);
         self.settle(&copy, state);
         if let Some((buffer, footprint)) = read {
+            self.keep(&buffer);
             self.pass_captures.lock().unwrap_or_else(|e| e.into_inner()).push(
                 crate::capture::PassSnapshot { name, buffer, footprint },
             );
@@ -7089,6 +7168,7 @@ impl HostList {
         // SAFETY: the state is restored before the next draw/dispatch.
         unsafe { self.list.ResourceBarrier(&[transition(source, copying, state)]) };
         if let Some(buffer) = read {
+            self.keep(&buffer);
             tracing::info!(%name, ?ranges, bytes, "mesh buffer readback recorded");
             self.pass_captures.lock().unwrap_or_else(|e| e.into_inner()).push(
                 crate::capture::PassSnapshot {
@@ -12133,3 +12213,143 @@ mod mesh_scratch {
 
 #[cfg(test)]
 mod upload_placed_tests;
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod capture_submission_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, mpsc};
+
+    static PAUSE: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
+
+    pub(super) fn pause_after_completion() {
+        let gate = PAUSE.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait();
+            gate.wait();
+        }
+    }
+
+    fn captured(list: &HostList, source: &ID3D12Resource, label: &str) -> String {
+        list.capture_buffer_parts(source, D3D12_RESOURCE_STATE_COMMON, &[(16,16),(0,8)], label);
+        let all = list.pass_captures.lock().unwrap();
+        assert_eq!(all.len(),1,"one bounded record");
+        all[0].name.clone()
+    }
+
+    fn bytes(folder: &std::path::Path, name: &str) -> Vec<u8> {
+        std::fs::read(folder.join(format!("{name}.bin"))).expect("saved before reset")
+    }
+
+    /// A fenced GPU regression for the submission/reset lifecycle. Its pause
+    /// is CPU-only and test-only; no production capture can wait on this gate.
+    #[test]
+    #[ignore = "isolated actual hardware process with VICTORY_CAPTURE and PASS_CAPTURE_SUBMIT=1"]
+    fn submitted_captures_are_saved_before_reset_and_survive_reexecution() {
+        use windows::core::Interface;
+        let host = host().expect("actual hardware device");
+        // SAFETY: ordinary DXGI adapter description query.
+        let desc = unsafe { host.adapter.as_ref().expect("adapter").cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,0,"software adapter refused");
+        let folder = crate::capture::folder().expect("isolated output directory");
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::write(folder.join("pass-now"), []).unwrap();
+        let (source, data) = host.shared_buffer(32).unwrap();
+        // SAFETY: 32 bytes of owned CPU-mapped storage, before GPU use.
+        unsafe { for i in 0..32 { data.add(i).write(i as u8); } }
+        let expected: Vec<_> = (16u8..32).chain(0..8).collect();
+
+        // Asynchronous title submissions need persistence before returning;
+        // a subsequent execution may overwrite the same readback resource.
+        let list = host.new_list().unwrap();
+        let name = captured(&list,&source,"submit-retained");
+        list.close();
+        host.execute_own(&list);
+        // The disabled control is asynchronous. Settle before its expected
+        // missing-file assertion so a panic cannot drop an in-flight list.
+        host.execute(&[]);
+        eprintln!("CAPTURE_PHASE first returned");
+        assert_eq!(bytes(folder,&name),expected);
+        let meta = std::fs::read_to_string(folder.join(format!("{name}.json"))).unwrap();
+        assert!(!meta.contains("\"completion_fence\":null"));
+        assert!(meta.contains("\"executions_in_submission\":1"));
+        assert!(list.pass_captures.lock().unwrap().is_empty());
+        // There must still be a live reference to the readback in the list:
+        // even after the pending snapshot is gone it is a GPU destination.
+        assert!(!list.deferred().kept.is_empty());
+        // SAFETY: execute_own above fenced this captured list before returning.
+        unsafe { std::ptr::write_bytes(data, 0xa7, 32); }
+        host.execute(&[&list]);
+        assert_eq!(bytes(folder,&name),expected,"first snapshot remains immutable");
+        list.reset();
+
+        // A synchronous batch uses distinct closed recordings. Direct lists
+        // must finish their previous use before being re-executed; duplicate
+        // pointers in one ExecuteCommandLists call are not a legal reuse test.
+        let batch_a = host.new_list().unwrap();
+        let batch_b = host.new_list().unwrap();
+        let name2a = captured(&batch_a,&source,"submit-batch-a");
+        let name2b = captured(&batch_b,&source,"submit-batch-b");
+        batch_a.close(); batch_b.close();
+        host.execute(&[&batch_a,&batch_b]);
+        for name in [&name2a,&name2b] {
+            assert_eq!(bytes(folder,name),[0xa7;24]);
+            let meta=std::fs::read_to_string(folder.join(format!("{name}.json"))).unwrap();
+            assert!(meta.contains("\"executions_in_submission\":1"));
+        }
+        batch_a.reset(); batch_b.reset();
+
+        // Hold the first submit after its GPU fence but before mapping.
+        // Each thread owns its HostList; only free-threaded D3D12 resources
+        // cross threads. A second real submission overwrites that exact
+        // readback buffer, reproducing the re-execution race without making
+        // the deliberately non-Sync HostList type shareable.
+        let gate = Arc::new(Barrier::new(2));
+        *PAUSE.lock().unwrap() = Some(gate.clone());
+        let name3 = std::thread::scope(|scope| {
+            let (capture_tx,capture_rx)=mpsc::channel();
+            let source_for_first=&source;
+            let first=scope.spawn(move || {
+                let recording=host.new_list().unwrap();
+                let name=captured(&recording,source_for_first,"submit-racing");
+                let readback=recording.pass_captures.lock().unwrap()[0].buffer.clone();
+                recording.close();
+                capture_tx.send((name,readback)).unwrap();
+                host.execute_own(&recording);
+            });
+            let (name,readback)=capture_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            gate.wait();
+            let (started_tx,started_rx)=mpsc::channel();
+            let (done_tx,done_rx)=mpsc::channel();
+            let second=scope.spawn(move || {
+                let (upload,upload_data)=host.upload_buffer(24).unwrap();
+                // SAFETY: owned upload mapping before any submission reads it.
+                unsafe { std::ptr::write_bytes(upload_data,0x53,24); }
+                let overwrite=host.new_list().unwrap();
+                // SAFETY: open list and 24-byte live resources. The capture
+                // destination remains COPY_DEST throughout its lifetime.
+                unsafe { overwrite.list.CopyBufferRegion(&readback,0,&upload,0,24); }
+                overwrite.keep(&upload); overwrite.keep(&readback); overwrite.close();
+                started_tx.send(()).unwrap();
+                host.execute(&[&overwrite]);
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let excluded=done_rx.recv_timeout(std::time::Duration::from_millis(80)).is_err();
+            // Release before assertions so failure cannot strand the first.
+            gate.wait();
+            first.join().unwrap(); second.join().unwrap();
+            assert!(excluded,"a competing submission overwrote an unmapped snapshot");
+            name
+        });
+        assert_eq!(bytes(folder,&name3),[0xa7;24],"snapshot precedes competing GPU overwrite");
+
+        // Closing and abandoning a recording does not complete a readback.
+        let abandoned=host.new_list().unwrap();
+        let name4=captured(&abandoned,&source,"submit-abandoned");
+        abandoned.close(); abandoned.reset();
+        assert!(!folder.join(format!("{name4}.bin")).exists());
+        assert!(!folder.join(format!("{name4}.json")).exists());
+        assert_eq!(host.log_messages(),None);
+        eprintln!("CAPTURE_SUBMIT_NATIVE async=true batch=true concurrent_excluded=true abandoned_discarded=true exact=true");
+    }
+}
