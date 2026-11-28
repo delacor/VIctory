@@ -2356,6 +2356,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// GPU constant buffers made in this recording; reset only after completion.
+    gpu_constants: usize,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -3696,6 +3698,8 @@ impl RelayBack {
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    constant_copy::line(frames);
     if !late() {
         return;
     }
@@ -3830,6 +3834,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+mod constant_copy;
 pub(crate) mod rec;
 mod send;
 mod upq;
